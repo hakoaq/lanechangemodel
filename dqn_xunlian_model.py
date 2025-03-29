@@ -33,6 +33,7 @@ sys.path.append(tools)
 SUMO_CONFIG_PATH = "a.sumocfg"
 SUMO_BINARY = sumolib.checkBinary("sumo")  # 使用"sumo-gui"可进行可视化
 
+
 # DQN智能体（优化版本）
 class LaneChangeDQNAgent:
     def __init__(self, state_size, action_size):
@@ -99,11 +100,11 @@ class LaneChangeDQNAgent:
         history = self.model.fit(states, targets, epochs=1, verbose=0, batch_size=self.batch_size)
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
-        
+
         self.update_count += 1
         if self.update_count % self.update_frequency == 0:
             self.update_target_model()
-        
+
         return history.history['loss'][0]
 
     def save(self, name):
@@ -130,7 +131,8 @@ class SUMOEnvironment:
         self.last_lane_change_step = 0
 
     def start_simulation(self):
-        sumo_cmd = [self.sumo_binary, "-c", self.sumo_config_path, "--start", "--step-length", str(self.sim_step_length)]
+        sumo_cmd = [self.sumo_binary, "-c", self.sumo_config_path, "--start", "--step-length",
+                    str(self.sim_step_length)]
         if self.sumo_binary == "sumo":
             sumo_cmd.extend(["--no-step-log", "--no-warnings"])
         traci.start(sumo_cmd)
@@ -161,11 +163,11 @@ class SUMOEnvironment:
             speed = traci.vehicle.getSpeed(self.ego_vehicle_id)
             lane = traci.vehicle.getLaneIndex(self.ego_vehicle_id)
             state[0] = speed / 33.33  # 归一化速度
-            state[1] = lane / 2.0     # 归一化车道索引
-            
+            state[1] = lane / 2.0  # 归一化车道索引
+
             # 周围车辆信息
             ego_pos = traci.vehicle.getPosition(self.ego_vehicle_id)
-            
+
             # 初始化距离值
             ranges = {
                 'front': 100.0,
@@ -175,7 +177,7 @@ class SUMOEnvironment:
                 'right_front': 100.0,
                 'right_back': 100.0
             }
-            
+
             # 检测周围车辆
             surrounding_vehicles = traci.vehicle.getContextSubscriptionResults(self.ego_vehicle_id)
             if surrounding_vehicles:
@@ -187,7 +189,7 @@ class SUMOEnvironment:
                         dx = v_pos[0] - ego_pos[0]  # 纵向距离
                         dy = v_pos[1] - ego_pos[1]  # 横向距离
                         distance = np.hypot(dx, dy)
-                        
+
                         # 确定车辆相对位置
                         if v_lane == lane - 1:  # 左侧车道
                             if dx > 0:  # 前方
@@ -204,7 +206,7 @@ class SUMOEnvironment:
                                 ranges['front'] = min(ranges['front'], distance)
                             else:  # 后方
                                 ranges['back'] = min(ranges['back'], distance)
-            
+
             # 归一化距离并设置状态
             state[2] = ranges['front'] / 100.0
             state[3] = ranges['back'] / 100.0
@@ -212,24 +214,24 @@ class SUMOEnvironment:
             state[5] = ranges['left_back'] / 100.0
             state[6] = ranges['right_front'] / 100.0
             state[7] = ranges['right_back'] / 100.0
-            
+
             # 当前车道信息和目标车道信息（与PPO一致）
             state[8] = lane / 2.0  # 当前车道（归一化）
             state[9] = 1.0 if lane == 1 else 0.0  # 是否在中间车道
-            
+
         except:
             pass
-        
+
         return state.reshape(1, self.state_size)
 
     def step(self, action):
         if self.ego_vehicle_id not in traci.vehicle.getIDList():
             return np.zeros((1, self.state_size)), -50, True, {}
-        
+
         old_lane = traci.vehicle.getLaneIndex(self.ego_vehicle_id)
         old_speed = traci.vehicle.getSpeed(self.ego_vehicle_id)
         collision = False
-        
+
         try:
             # 执行车道变更，使用duration=2与PPO一致
             if action == 1 and old_lane > 0:  # 左变道
@@ -238,27 +240,27 @@ class SUMOEnvironment:
             elif action == 2 and old_lane < 2:  # 右变道
                 traci.vehicle.changeLane(self.ego_vehicle_id, old_lane + 1, 2)
                 self.last_lane_change_step = self.current_step
-            
+
             # 控制速度
             current_speed = traci.vehicle.getSpeed(self.ego_vehicle_id)
             lane_id = traci.vehicle.getLaneID(self.ego_vehicle_id)
             desired_speed = min(traci.lane.getMaxSpeed(lane_id), current_speed + 1)
             traci.vehicle.setSpeed(self.ego_vehicle_id, desired_speed)
-            
+
             # 只执行一步模拟，与PPO一致
             traci.simulationStep()
-            
+
             # 检查碰撞
             if self.ego_vehicle_id in traci.simulation.getCollidingVehiclesIDList():
                 collision = True
             if self.ego_vehicle_id not in traci.vehicle.getIDList():
                 collision = True
-                
+
         except:
             collision = True
-        
+
         next_state = self._get_state()
-        
+
         # 获取当前状态
         if self.ego_vehicle_id in traci.vehicle.getIDList():
             new_lane = traci.vehicle.getLaneIndex(self.ego_vehicle_id)
@@ -268,16 +270,16 @@ class SUMOEnvironment:
             new_lane = old_lane
             new_speed = 0
             lane_changed = False
-        
+
         # 计算奖励，更接近PPO的奖励结构
         reward = self._calculate_reward(action, old_lane, new_lane, old_speed, new_speed, collision, lane_changed)
-        
+
         self.current_step += 1
         done = collision or self.current_step >= self.max_steps or (
-            self.ego_vehicle_id in traci.vehicle.getIDList() and 
-            traci.vehicle.getLanePosition(self.ego_vehicle_id) > 900
+                self.ego_vehicle_id in traci.vehicle.getIDList() and
+                traci.vehicle.getLanePosition(self.ego_vehicle_id) > 900
         )
-        
+
         # 用于调试
         info = {
             'old_lane': old_lane,
@@ -288,7 +290,7 @@ class SUMOEnvironment:
             'collision': collision,
             'step': self.current_step
         }
-        
+
         self.last_action = action
         return next_state, reward, done, info
 
@@ -296,23 +298,23 @@ class SUMOEnvironment:
         """计算奖励，结构更接近PPO的奖励计算方式"""
         if collision:
             return -50.0  # 碰撞惩罚，与PPO一致
-        
+
         reward = 0.0
-        
+
         # 速度奖励
         reward += (new_speed / 33.33) * 0.3  # 根据车速给予奖励
-        
+
         # 车道位置奖励（鼓励在中间车道）
         reward += (2 - abs(new_lane - 1)) * 0.2
-        
+
         # 变道奖励
         if action != 0:  # 如果尝试变道
             reward += 0.2  # 与PPO一致，鼓励尝试变道行为
-        
+
         # 如果成功变道
         if lane_changed:
             reward += 0.5  # 额外奖励成功的变道
-        
+
         # 安全性奖励（保持安全距离）
         if self.ego_vehicle_id in traci.vehicle.getIDList():
             leader = traci.vehicle.getLeader(self.ego_vehicle_id)
@@ -320,7 +322,7 @@ class SUMOEnvironment:
                 lead_id, gap = leader
                 if gap < new_speed * 1.5:  # 如果跟车距离太近
                     reward -= 0.3  # 惩罚不安全跟车
-        
+
         return reward
 
     def close(self):
@@ -329,7 +331,7 @@ class SUMOEnvironment:
 
 
 # 训练函数
-def train_lane_change_agent(episodes=2000):
+def train_lane_change_agent(episodes=2):
     timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     results_dir = f"dqn_results_{timestamp}"
     models_dir = f"{results_dir}/models"
@@ -354,22 +356,22 @@ def train_lane_change_agent(episodes=2000):
         loss_count = 0
         lane_changes = 0
         done = False
-        
+
         while not done:
             action = agent.act(state)
             next_state, reward, done, info = env.step(action)
-            
+
             # 记录车道变更
             if info.get('lane_changed', False):
                 lane_changes += 1
-                
+
             agent.remember(state[0], action, reward, next_state[0], done)
             loss = agent.replay()
-            
+
             if loss > 0:  # 只有当训练发生时才记录损失
                 total_loss += loss
                 loss_count += 1
-                
+
             state = next_state
             total_reward += reward
 
@@ -392,39 +394,48 @@ def train_lane_change_agent(episodes=2000):
         bar = '#' * int(20 * progress) + '-' * (20 - int(20 * progress))
 
         # 日志输出
-        print(f"回合 {episode + 1}/{episodes} | 奖励: {total_reward:.2f} | 平均损失: {avg_loss:.4f} | 车道变更: {lane_changes}")
-        print(f"[{bar}] {progress * 100:.1f}% | 已用: {elapsed_time / 60:.2f} 分钟 | 剩余: {remaining_time / 60:.2f} 分钟")
+        print(
+            f"回合 {episode + 1}/{episodes} | 奖励: {total_reward:.2f} | 平均损失: {avg_loss:.4f} | 车道变更: {lane_changes}")
+        print(
+            f"[{bar}] {progress * 100:.1f}% | 已用: {elapsed_time / 60:.2f} 分钟 | 剩余: {remaining_time / 60:.2f} 分钟")
 
     env.close()
     agent.save(f"{models_dir}/dqn_model_final")
+    # 设置中文字体
+    try:
+        plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'Arial Unicode MS']
+        plt.rcParams['axes.unicode_minus'] = False
+        use_chinese = True
+    except:
+        use_chinese = False
 
     # 绘制训练曲线
     plt.figure(figsize=(15, 10))
-    
+
     plt.subplot(2, 2, 1)
     plt.plot(episode_rewards)
-    plt.title("回合奖励")
-    plt.xlabel("回合")
-    plt.ylabel("奖励")
-    
+    plt.title("Episode Rewards" if not use_chinese else "回合奖励")
+    plt.xlabel("Episode" if not use_chinese else "回合")
+    plt.ylabel("Reward" if not use_chinese else "奖励")
+
     plt.subplot(2, 2, 2)
     plt.plot(episode_lane_changes)
     plt.title("车道变更次数")
     plt.xlabel("回合")
     plt.ylabel("变更次数")
-    
+
     plt.subplot(2, 2, 3)
     plt.plot(train_info['loss'])
     plt.title("训练损失")
     plt.xlabel("回合")
     plt.ylabel("损失")
-    
+
     plt.subplot(2, 2, 4)
     plt.plot(train_info['epsilon'])
     plt.title("探索率")
     plt.xlabel("回合")
     plt.ylabel("Epsilon")
-    
+
     plt.tight_layout()
     plt.savefig(f"{results_dir}/training_curves.png")
     plt.close()
@@ -441,77 +452,16 @@ def train_lane_change_agent(episodes=2000):
     return agent, episode_rewards, episode_lane_changes
 
 
-# 测试函数
-def test_agent(model_path, test_episodes=10):
-    env = SUMOEnvironment("test_vehicle", SUMO_CONFIG_PATH, SUMO_BINARY)
-    
-    # 加载模型
-    model = load_model(model_path)
-    
-    class TestAgent:
-        def __init__(self, model):
-            self.model = model
-            
-        def act(self, state, training=False):
-            q_values = self.model.predict(state, verbose=0)
-            return np.argmax(q_values[0])
-    
-    agent = TestAgent(model)
-    
-    test_rewards = []
-    test_lane_changes = []
-    test_collisions = []
-    
-    for episode in range(test_episodes):
-        state = env.reset()
-        done = False
-        total_reward = 0
-        lane_changes = 0
-        collision = False
-        
-        while not done:
-            action = agent.act(state)
-            next_state, reward, done, info = env.step(action)
-            
-            if info.get('lane_changed', False):
-                lane_changes += 1
-            if info.get('collision', False):
-                collision = True
-                
-            state = next_state
-            total_reward += reward
-        
-        test_rewards.append(total_reward)
-        test_lane_changes.append(lane_changes)
-        test_collisions.append(1 if collision else 0)
-        
-        print(f"测试回合 {episode+1}: 奖励 {total_reward:.2f}, 车道变更 {lane_changes}, 碰撞 {collision}")
-    
-    env.close()
-    
-    # 打印测试结果
-    avg_reward = np.mean(test_rewards)
-    avg_lane_changes = np.mean(test_lane_changes)
-    avg_collisions = np.mean(test_collisions)
-    
-    print("\n测试结果摘要:")
-    print(f"平均奖励: {avg_reward:.2f}")
-    print(f"平均车道变更: {avg_lane_changes:.2f}")
-    print(f"碰撞率: {avg_collisions*100:.1f}%")
-    
-    return avg_reward, avg_lane_changes, avg_collisions
+
+
+
 
 
 if __name__ == "__main__":
     np.random.seed(42)
     tf.random.set_seed(42)
     random.seed(42)
-    
+
     print("开始训练DQN模型...")
-    agent, rewards, lane_changes = train_lane_change_agent(episodes=2000)
+    agent, rewards, lane_changes = train_lane_change_agent(episodes=2)
     print("训练完成！")
-    
-    # 测试最终模型
-    print("\n测试最终模型...")
-    model_path = f"dqn_results_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}/models/dqn_model_final.keras"
-    test_agent(model_path)
