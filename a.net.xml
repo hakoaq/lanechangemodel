@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<net version="1.20" junctionCornerDetail="5" limitTurnSpeed="5.50" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/net_file.xsd">
+
+    <location netOffset="0.00,0.00" convBoundary="-28.77,58.24,85.46,58.41" origBoundary="10000000000.00,10000000000.00,-10000000000.00,-10000000000.00" projParameter="!"/>
+
+    <edge id="E0" from="J0" to="J1" priority="-1">
+        <!-- 最左侧车道（小轿车），最低速110 km/h，最高速120 km/h -->
+        <lane id="E0_0" index="0" allow="passenger" speed="33.33" length="1000" shape="-28.76,50.24 85.47,50.41"/>
+        <!-- 中间车道（小轿车、货车、公交车），最低速90 km/h，最高速100 km/h -->
+        <lane id="E0_1" index="1" allow="passenger truck bus" speed="27.78" length="1000" shape="-28.77,53.44 85.47,53.61"/>
+        <!-- 最右侧车道（货车、公交车、摩托车），最低速60 km/h，最高速80 km/h -->
+        <lane id="E0_2" index="2" allow="truck bus motorcycle" speed="22.22" length="1000" shape="-28.77,56.64 85.46,56.81"/>
+    </edge>
+
+    <junction id="J0" type="dead_end" x="-28.77" y="58.24" incLanes="" intLanes="" shape="-28.77,58.24 -28.76,48.64"/>
+    <junction id="J1" type="dead_end" x="85.46" y="58.41" incLanes="E0_0 E0_1 E0_2" intLanes="" shape="85.48,48.81 85.46,58.41"/>
+
+</net>
