@@ -9,6 +9,9 @@ import torch.optim as optim
 from torch.distributions import Categorical
 import subprocess
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+import datetime
+
 
 # ========== 配置区 ==========
 class Config:
@@ -17,18 +20,19 @@ class Config:
     ego_vehicle_id = "drl_ego_car"
     port_range = (8873, 8900)
 
-    episodes = 20
-    max_steps = 2 # 增加最大步数以延长训练时间
+    episodes = 1000
+    max_steps = 2000  # 增加最大步数以延长训练时间，而不是只有2步
     gamma = 0.995
     clip_epsilon = 0.2
     learning_rate = 1e-3
     batch_size = 256
-    hidden_size = 512  # 增加隐藏层大小以提升模型能力
+    hidden_size = 512
     save_dir = "./models"
     log_interval = 10
 
     state_dim = 10  # [速度, 车道, 前车距, 后车距, 左前, 左后, 右前, 右后, 当前车道, 目标车道]
     action_dim = 3  # 0:保持, 1:左变, 2:右变
+
 
 # ========== SUMO环境封装 ==========
 class SumoEnv:
@@ -36,7 +40,8 @@ class SumoEnv:
         self.current_port = Config.port_range[0]
         self.sumo_process = None
         self.change_lane_count = 0  # 记录变道次数
-        self.collision_count = 0   # 记录撞车次数
+        self.collision_count = 0  # 记录撞车次数
+        self.current_step = 0  # 添加当前步数计数
 
     def _init_sumo_cmd(self, port):
         return [
@@ -55,6 +60,7 @@ class SumoEnv:
         self._add_ego_vehicle()
         self.change_lane_count = 0
         self.collision_count = 0
+        self.current_step = 0  # 重置步数计数
         return self._get_state()
 
     def _start_sumo(self):
@@ -96,7 +102,7 @@ class SumoEnv:
             speed = traci.vehicle.getSpeed(Config.ego_vehicle_id)
             lane = traci.vehicle.getLaneIndex(Config.ego_vehicle_id)
             state[0] = speed / 33.33  # 速度归一化到 [0, 1]
-            state[1] = lane / 2.0     # 车道归一化到 [0, 1]
+            state[1] = lane / 2.0  # 车道归一化到 [0, 1]
             self._update_surrounding_vehicles(state)
             state[8] = state[1]
             state[9] = 1.0 if lane == 1 else 0.0  # 目标车道（中间车道）
@@ -152,10 +158,11 @@ class SumoEnv:
                 self.change_lane_count += 1
             traci.simulationStep()
             reward = self._calculate_reward(action)
+            self.current_step += 1  # 增加步数计数
         except traci.TraCIException:
             done = True
         next_state = self._get_state()
-        done = done or traci.simulation.getTime() > 3600
+        done = done or traci.simulation.getTime() > 3600 or self.current_step >= Config.max_steps
         return next_state, reward, done
 
     def _calculate_reward(self, action):
@@ -164,13 +171,13 @@ class SumoEnv:
             for collision in traci.simulation.getCollisions():
                 if collision.collider == Config.ego_vehicle_id or collision.victim == Config.ego_vehicle_id:
                     self.collision_count += 1
-                    return -10.0  # 减小碰撞惩罚，鼓励探索
+                    return -10.0
         speed = traci.vehicle.getSpeed(Config.ego_vehicle_id)
-        reward += (speed / 33.33) * 0.5  # 增加速度奖励
+        reward += (speed / 33.33) * 0.5
         lane = traci.vehicle.getLaneIndex(Config.ego_vehicle_id)
-        reward += (2 - abs(lane - 1)) * 0.3  # 奖励保持中间车道
+        reward += (2 - abs(lane - 1)) * 0.3
         if action != 0:
-            reward += 0.2  # 增加变道奖励，鼓励变道
+            reward += 0.2
         return reward
 
     def _close(self):
@@ -190,6 +197,7 @@ class SumoEnv:
         if os.name == 'nt':
             os.system("taskkill /f /im sumo.exe >nul 2>&1")
             os.system("taskkill /f /im sumo-gui.exe >nul 2>&1")
+
 
 # ========== PPO算法实现 ==========
 class PPO(nn.Module):
@@ -218,11 +226,16 @@ class PPO(nn.Module):
     def forward(self, x):
         return self.actor(x), self.critic(x)
 
+
 class Agent:
     def __init__(self):
         self.policy = PPO()
         self.optimizer = optim.Adam(self.policy.parameters(), lr=Config.learning_rate)
         self.memory = []
+        # 添加损失跟踪
+        self.actor_losses = []
+        self.critic_losses = []
+        self.total_losses = []
 
     def get_action(self, state):
         state_tensor = torch.FloatTensor(state)
@@ -241,18 +254,26 @@ class Agent:
 
     def update(self):
         if len(self.memory) < Config.batch_size:
-            return
+            return {"actor_loss": 0, "critic_loss": 0, "total_loss": 0}
+
         states = torch.FloatTensor([t[0] for t in self.memory])
         actions = torch.LongTensor([t[1] for t in self.memory])
         old_log_probs = torch.FloatTensor([t[2] for t in self.memory])
         rewards = torch.FloatTensor([t[3] for t in self.memory])
+
         discounted_rewards = []
         running_reward = 0
         for r in reversed(rewards.numpy()):
             running_reward = r + Config.gamma * running_reward
             discounted_rewards.insert(0, running_reward)
+
         discounted_rewards = torch.FloatTensor(discounted_rewards)
         discounted_rewards = (discounted_rewards - discounted_rewards.mean()) / (discounted_rewards.std() + 1e-7)
+
+        total_actor_loss = 0
+        total_critic_loss = 0
+        total_loss = 0
+
         for _ in range(5):
             new_probs, values = self.policy(states)
             dist = Categorical(new_probs)
@@ -264,51 +285,149 @@ class Agent:
             actor_loss = -torch.min(surr1, surr2).mean()
             critic_loss = nn.MSELoss()(values.squeeze(), discounted_rewards)
             loss = actor_loss + 0.5 * critic_loss
+
             self.optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
             self.optimizer.step()
+
+            total_actor_loss += actor_loss.item()
+            total_critic_loss += critic_loss.item()
+            total_loss += loss.item()
+
+        avg_actor_loss = total_actor_loss / 5
+        avg_critic_loss = total_critic_loss / 5
+        avg_total_loss = total_loss / 5
+
+        self.actor_losses.append(avg_actor_loss)
+        self.critic_losses.append(avg_critic_loss)
+        self.total_losses.append(avg_total_loss)
+
         self.memory.clear()
+
+        return {
+            "actor_loss": avg_actor_loss,
+            "critic_loss": avg_critic_loss,
+            "total_loss": avg_total_loss
+        }
+
 
 # ========== 训练主循环 ==========
 def main():
-    os.makedirs(Config.save_dir, exist_ok=True)
+    # 创建时间戳和目录
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    results_dir = f"ppo_results_{timestamp}"
+    models_dir = f"{results_dir}/models"
+    os.makedirs(models_dir, exist_ok=True)
+
     env = SumoEnv()
     agent = Agent()
     best_reward = -float('inf')
+
+    # 用于追踪训练过程
+    episode_rewards = []
+    episode_steps = []
+    episode_lane_changes = []
+    episode_collisions = []
+    losses = []
+
     try:
         for episode in tqdm(range(1, Config.episodes + 1), desc="Training Episodes"):
             state = env.reset()
             episode_reward = 0
             done = False
-            for step in range(Config.max_steps):
+            step_count = 0
+
+            while not done and step_count < Config.max_steps:
                 action, log_prob = agent.get_action(state)
                 next_state, reward, done = env.step(action)
                 agent.memory.append((state, action, log_prob, reward))
                 episode_reward += reward
                 state = next_state
-                if step % 100 == 0:  # 每100步更新一次策略，增加训练强度
-                    agent.update()
-                if done:
-                    break
+                step_count += 1
+
+                if len(agent.memory) >= Config.batch_size:
+                    loss_info = agent.update()
+                    losses.append(loss_info["total_loss"])
+
+            # 最后的更新
             if len(agent.memory) > 0:
-                agent.update()
+                loss_info = agent.update()
+                if loss_info["total_loss"] > 0:
+                    losses.append(loss_info["total_loss"])
+
+            # 追踪训练数据
+            episode_rewards.append(episode_reward)
+            episode_steps.append(env.current_step)
+            episode_lane_changes.append(env.change_lane_count)
+            episode_collisions.append(env.collision_count)
+
+            # 保存最佳模型
             if episode_reward > best_reward:
                 best_reward = episode_reward
-                torch.save(agent.policy.state_dict(), f"{Config.save_dir}/best_model.pth")
+                torch.save(agent.policy.state_dict(), f"{models_dir}/best_model.pth")
                 print(f"🎉 发现新最佳模型！奖励：{best_reward:.2f}")
+
+            # 输出日志
             if episode % Config.log_interval == 0:
                 print(f"Episode {episode}, 奖励：{episode_reward:.2f}, 最佳：{best_reward:.2f}, "
                       f"变道次数：{env.change_lane_count}, 撞车次数：{env.collision_count}")
+
     except KeyboardInterrupt:
         print("手动中断")
     finally:
         env._close()
-        torch.save(agent.policy.state_dict(), os.path.join(Config.save_dir, "last_model.pth"))
+        # 保存最后的模型
+        torch.save(agent.policy.state_dict(), os.path.join(models_dir, "last_model.pth"))
+
+        # 绘制训练曲线
+        plt.figure(figsize=(15, 10))
+
+        plt.subplot(2, 2, 1)
+        plt.plot(episode_rewards)
+        plt.title("回合奖励")
+        plt.xlabel("回合")
+        plt.ylabel("奖励")
+
+        plt.subplot(2, 2, 2)
+        plt.plot(episode_lane_changes)
+        plt.title("车道变更次数")
+        plt.xlabel("回合")
+        plt.ylabel("变更次数")
+
+        plt.subplot(2, 2, 3)
+        plt.plot(losses)
+        plt.title("训练损失")
+        plt.xlabel("更新次数")
+        plt.ylabel("损失")
+
+        plt.subplot(2, 2, 4)
+        plt.plot(episode_collisions)
+        plt.title("碰撞次数")
+        plt.xlabel("回合")
+        plt.ylabel("次数")
+
+        plt.tight_layout()
+        plt.savefig(f"{results_dir}/training_curves.png")
+        plt.close()
+
+        # 保存训练数据为.npz文件
+        np.savez(f"{results_dir}/training_data.npz",
+                 rewards=episode_rewards,
+                 lane_changes=episode_lane_changes,
+                 steps=episode_steps,
+                 collisions=episode_collisions,
+                 actor_losses=agent.actor_losses,
+                 critic_losses=agent.critic_losses,
+                 total_losses=agent.total_losses)
+
+        print(f"训练完成，结果保存在: {results_dir}")
+
 
 if __name__ == "__main__":
     if not (os.path.exists(Config.sumo_binary) or "SUMO_HOME" in os.environ):
-        raise ValueError("SUMO路径错误，请检查SUMO是否正确安装并设置环境变量SUMO_HOME，或在Config类中设置正确的sumo_binary路径")
+        raise ValueError(
+            "SUMO路径错误，请检查SUMO是否正确安装并设置环境变量SUMO_HOME，或在Config类中设置正确的sumo_binary路径")
     if not os.path.exists(Config.config_path):
         raise ValueError(f"配置文件不存在：{Config.config_path}")
     main()
