@@ -11,24 +11,24 @@ from torch.distributions import Categorical
 import traci
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-
+import matplotlib
 # ========== 配置区 ==========
 class Config:
     # SUMO配置
     sumo_binary = "sumo"  # 如果已设置SUMO_HOME，可直接使用"sumo"
     config_path = "a.sumocfg"
     ego_vehicle_id = "drl_ego_car"
-    port_range = (8873, 8900)
+    port_range = (8890, 8900)
 
     # 训练参数
     episodes = 1000
     max_steps = 2000
     gamma = 0.99
     clip_epsilon = 0.1
-    learning_rate = 3e-4
+    learning_rate = 1e-4
     batch_size = 256
     ppo_epochs = 3       # 每次更新时的迭代轮数
-    hidden_size = 512
+    hidden_size = 256    # 降低隐藏层规模以稳定训练
     log_interval = 10
 
     # 状态和动作维度
@@ -82,7 +82,6 @@ class SumoEnv:
         raise ConnectionError("无法在指定端口范围内连接SUMO！")
 
     def _add_ego_vehicle(self):
-        # 自定义一条ego_route，用于添加自车
         if "ego_route" not in traci.route.getIDList():
             traci.route.add("ego_route", ["E0"])
         traci.vehicle.addFull(
@@ -104,11 +103,10 @@ class SumoEnv:
             speed = traci.vehicle.getSpeed(Config.ego_vehicle_id)
             lane = traci.vehicle.getLaneIndex(Config.ego_vehicle_id)
             state[0] = speed / 33.33
-            state[1] = lane / 2.0
+            state[1] = lane / 2.0  # 归一化车道信息：0, 0.5, 1 分别对应车道 0,1,2
             self._update_surrounding_vehicles(state)
             state[8] = state[1]   # 当前车道
-            # 目标车道（这里暂且设中间车道为目标，若当前即中间，则设1，否则0）
-            state[9] = 1.0 if lane == 1 else 0.0
+            state[9] = 1.0 if lane == 1 else 0.0  # 目标车道：暂设中间车道为优先
         except traci.TraCIException:
             pass
         return state
@@ -116,7 +114,6 @@ class SumoEnv:
     def _update_surrounding_vehicles(self, state):
         ego_pos = traci.vehicle.getPosition(Config.ego_vehicle_id)
         ego_lane = traci.vehicle.getLaneIndex(Config.ego_vehicle_id)
-        # 初始化各方向距离为较大值(单位米，后续要除100归一化)
         ranges = {
             'front': 100.0, 'back': 100.0,
             'left_front': 100.0, 'left_back': 100.0,
@@ -131,26 +128,20 @@ class SumoEnv:
             dy = veh_pos[1] - ego_pos[1]
             distance = np.hypot(dx, dy)
             if veh_lane == ego_lane:
-                if dx > 0:  # 前车
-                    if distance < ranges['front']:
-                        ranges['front'] = distance
-                else:       # 后车
-                    if distance < ranges['back']:
-                        ranges['back'] = distance
-            elif veh_lane == ego_lane - 1:  # 左侧车道
                 if dx > 0:
-                    if distance < ranges['left_front']:
-                        ranges['left_front'] = distance
+                    ranges['front'] = min(ranges['front'], distance)
                 else:
-                    if distance < ranges['left_back']:
-                        ranges['left_back'] = distance
-            elif veh_lane == ego_lane + 1:  # 右侧车道
+                    ranges['back'] = min(ranges['back'], distance)
+            elif veh_lane == ego_lane - 1:
                 if dx > 0:
-                    if distance < ranges['right_front']:
-                        ranges['right_front'] = distance
+                    ranges['left_front'] = min(ranges['left_front'], distance)
                 else:
-                    if distance < ranges['right_back']:
-                        ranges['right_back'] = distance
+                    ranges['left_back'] = min(ranges['left_back'], distance)
+            elif veh_lane == ego_lane + 1:
+                if dx > 0:
+                    ranges['right_front'] = min(ranges['right_front'], distance)
+                else:
+                    ranges['right_back'] = min(ranges['right_back'], distance)
         state[2] = ranges['front'] / 100.0
         state[3] = ranges['back'] / 100.0
         state[4] = ranges['left_front'] / 100.0
@@ -174,7 +165,6 @@ class SumoEnv:
             reward = self._calculate_reward(action)
             self.current_step += 1
         except traci.TraCIException:
-            # 自车可能已被移除(极端情况), 直接done
             done = True
 
         next_state = self._get_state()
@@ -183,35 +173,22 @@ class SumoEnv:
         return next_state, reward, done
 
     def _calculate_reward(self, action):
-        # 如果发生碰撞
         collisions = traci.simulation.getCollisions()
         if collisions:
             for collision in collisions:
-                if (collision.collider == Config.ego_vehicle_id or 
-                    collision.victim == Config.ego_vehicle_id):
+                if collision.collider == Config.ego_vehicle_id or collision.victim == Config.ego_vehicle_id:
                     self.collision_count += 1
                     return -50.0  # 碰撞惩罚
 
-        # 根据自车速度和车道给予奖励
         speed = traci.vehicle.getSpeed(Config.ego_vehicle_id)
         speed_reward = (speed / 33.33) * 0.5
         lane = traci.vehicle.getLaneIndex(Config.ego_vehicle_id)
-        lane_reward = (2 - abs(lane - 1)) * 0.3  # 假设中间车道优先
-
-        # 对于变道给予少量奖励，鼓励尝试(可选)
+        lane_reward = (2 - abs(lane - 1)) * 0.3  # 优先中间车道
         change_lane_bonus = 0.1 if action != 0 else 0.0
 
-        # 可选：若与前车非常接近，也给一个负奖励，鼓励保持安全距离
-        front_dist = traci.vehicle.getDistance(
-            Config.ego_vehicle_id, traci.vehicle.getLaneID(Config.ego_vehicle_id), 10.0, 1
-        )
-        # 上面这个API只是示例，也可用 _update_surrounding_vehicles 里存的 front_dist
-        # 这里简单写一个：当前车距离小于 5 米，给额外惩罚
-        safe_distance_penalty = 0.0
         ego_state = self._get_state()
-        front_dist_norm = ego_state[2] * 100  # front 距离的实际米数
-        if front_dist_norm < 5.0:
-            safe_distance_penalty = -1.0
+        front_dist_norm = ego_state[2] * 100  # 恢复实际距离
+        safe_distance_penalty = -1.0 if front_dist_norm < 5.0 else 0.0
 
         return speed_reward + lane_reward + change_lane_bonus + safe_distance_penalty
 
@@ -242,15 +219,11 @@ class PPO(nn.Module):
             nn.ReLU(),
             nn.Linear(Config.hidden_size, Config.hidden_size),
             nn.ReLU(),
-            nn.Linear(Config.hidden_size, Config.hidden_size),
-            nn.ReLU(),
             nn.Linear(Config.hidden_size, Config.action_dim),
             nn.Softmax(dim=-1)
         )
         self.critic = nn.Sequential(
             nn.Linear(Config.state_dim, Config.hidden_size),
-            nn.ReLU(),
-            nn.Linear(Config.hidden_size, Config.hidden_size),
             nn.ReLU(),
             nn.Linear(Config.hidden_size, Config.hidden_size),
             nn.ReLU(),
@@ -273,15 +246,16 @@ class Agent:
     def get_action(self, state):
         state_tensor = torch.FloatTensor(state)
         probs, _ = self.policy(state_tensor)
-        # 动作屏蔽：不允许最左车道再左变、最右车道再右变
+        # 动作屏蔽：确保最左侧禁止左变，最右侧禁止右变
         lane = int(state[1] * 2)
         mask = [1.0] * Config.action_dim
         if lane == 0:
             mask[1] = 0.0
         elif lane == 2:
             mask[2] = 0.0
-        probs = probs * torch.tensor(mask)
-        probs = probs / probs.sum()  # 重新归一化
+        mask_tensor = torch.tensor(mask)
+        probs = probs * mask_tensor
+        probs = probs / (probs.sum() + 1e-8)  # 重新归一化
         dist = Categorical(probs)
         action = dist.sample()
         return action.item(), dist.log_prob(action)
@@ -292,10 +266,8 @@ class Agent:
 
     def update(self):
         if len(self.memory) < Config.batch_size:
-            # 不足一个batch，先不更新
             return
 
-        # 提取记忆
         states = torch.FloatTensor([m[0] for m in self.memory])
         actions = torch.LongTensor([m[1] for m in self.memory])
         old_log_probs = torch.FloatTensor([m[2] for m in self.memory])
@@ -308,11 +280,20 @@ class Agent:
             running = r + Config.gamma * running
             discounted_rewards.insert(0, running)
         discounted_rewards = torch.FloatTensor(discounted_rewards)
-        # 归一化
         discounted_rewards = (discounted_rewards - discounted_rewards.mean()) / (discounted_rewards.std() + 1e-7)
 
         for _ in range(Config.ppo_epochs):
             new_probs, values = self.policy(states)
+            # 根据状态中的车道信息重新应用动作屏蔽
+            lanes = (states[:, 1] * 2).long()  # 0, 1, 2
+            mask = torch.ones_like(new_probs)
+            mask[lanes == 0, 1] = 0.0  # 若车道为0，左变非法
+            mask[lanes == 2, 2] = 0.0  # 若车道为2，右变非法
+
+            new_probs = new_probs * mask
+            new_probs_sum = new_probs.sum(dim=1, keepdim=True)
+            new_probs = new_probs / (new_probs_sum + 1e-8)
+
             dist = Categorical(new_probs)
             new_log_probs = dist.log_prob(actions)
 
@@ -324,7 +305,8 @@ class Agent:
 
             actor_loss = -torch.min(surr1, surr2).mean()
             critic_loss = nn.MSELoss()(values.squeeze(), discounted_rewards)
-            loss = actor_loss + 0.5 * critic_loss
+            entropy_bonus = dist.entropy().mean()
+            loss = actor_loss - 0.01 * entropy_bonus + 0.5 * critic_loss
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -348,7 +330,6 @@ def main():
     agent = Agent()
     best_reward = -float('inf')
 
-    # 记录数据
     all_rewards = []
     lane_change_counts = []
     collision_counts = []
@@ -365,12 +346,10 @@ def main():
                 action, log_prob = agent.get_action(state)
                 next_state, reward, done = env.step(action)
                 agent.store((state, action, log_prob.item(), reward))
-
                 state = next_state
                 episode_reward += reward
                 step_count += 1
 
-            # 回合结束后再统一更新(提高样本效率，减少噪声)
             agent.update()
 
             all_rewards.append(episode_reward)
@@ -378,7 +357,6 @@ def main():
             collision_counts.append(env.collision_count)
             total_steps_per_episode.append(step_count)
 
-            # 保存最佳模型
             if episode_reward > best_reward:
                 best_reward = episode_reward
                 torch.save(agent.policy.state_dict(), os.path.join(models_dir, "best_model.pth"))
@@ -392,10 +370,9 @@ def main():
         print("训练被手动中断...")
     finally:
         env._close()
-        # 保存最终模型
         torch.save(agent.policy.state_dict(), os.path.join(models_dir, "last_model.pth"))
-
-        # 绘制曲线
+        matplotlib.rcParams['font.sans-serif'] = ['SimHei']
+        matplotlib.rcParams['axes.unicode_minus'] = False
         plt.figure(figsize=(15, 8))
 
         plt.subplot(2, 2, 1)
