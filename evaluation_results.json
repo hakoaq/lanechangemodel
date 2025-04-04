@@ -1,103 +1,39 @@
 {
-    "ppo": {
-        "episode_reward": {
-            "mean": -64.08522581572275,
-            "std": 8.400742240828095,
-            "min": -76.21299958528905,
-            "max": -50.092927489854354,
-            "median": -65.10230306020222
-        },
-        "episode_length": {
-            "mean": 229.95,
-            "std": 53.56162338839255,
-            "min": 150.0,
-            "max": 322.0,
-            "median": 230.0
-        },
-        "lane_changes": {
-            "mean": 0.9,
-            "std": 1.445683229480096,
-            "min": 0.0,
-            "max": 5.0,
-            "median": 0.0
-        },
-        "lane_change_attempts": {
-            "mean": 2.0,
-            "std": 5.0099900199501395,
-            "min": 0.0,
-            "max": 21.0,
-            "median": 0.0
-        },
-        "collisions": {
-            "mean": 1.0,
-            "std": 0.0,
-            "min": 1.0,
-            "max": 1.0,
-            "median": 1.0
-        },
-        "average_speed": {
-            "mean": 22.964334884492537,
-            "std": 5.613837548458994,
-            "min": 15.450870023610738,
-            "max": 33.205340995583924,
-            "median": 21.656807062315234
-        },
-        "safe_distance_violations": {
-            "mean": 1.35,
-            "std": 3.1980462785894765,
-            "min": 0.0,
-            "max": 11.0,
-            "median": 0.0
-        },
-        "comfort_violations": {
-            "mean": 4.15,
-            "std": 9.24810791459529,
-            "min": 0.0,
-            "max": 41.0,
-            "median": 0.0
-        },
-        "lane_distribution": {
-            "fast_lane": 22.59500335945483,
-            "middle_lane_1": 18.545752962087654,
-            "middle_lane_2": 25.69842124499566,
-            "slow_lane": 33.16082243346186
-        },
-        "completion_rate": {
-            "mean": 0.0,
-            "std": 0.0,
-            "min": 0.0,
-            "max": 0.0,
-            "median": 0.0
-        }
-    },
     "dqn": {
         "episode_reward": {
-            "mean": -71.99230241822791,
-            "std": 2.958038768544186,
-            "min": -77.73216561660604,
-            "max": -66.58496794913864,
-            "median": -71.84715643042281
+            "mean": -72.09155298559557,
+            "std": 3.3362320069681295,
+            "min": -76.79945312862307,
+            "max": -64.21161860373493,
+            "median": -72.52468732812095
         },
         "episode_length": {
-            "mean": 195.65,
-            "std": 27.410353883158827,
-            "min": 150.0,
-            "max": 258.0,
-            "median": 192.5
+            "mean": 201.1,
+            "std": 32.42360251421795,
+            "min": 160.0,
+            "max": 273.0,
+            "median": 194.0
         },
         "lane_changes": {
-            "mean": 9.75,
-            "std": 1.5451537140362444,
-            "min": 8.0,
+            "mean": 9.05,
+            "std": 1.9868316486305528,
+            "min": 5.0,
             "max": 13.0,
-            "median": 9.5
+            "median": 9.0
         },
         "lane_change_attempts": {
-            "mean": 193.2,
-            "std": 27.63258945520669,
-            "min": 150.0,
-            "max": 246.0,
-            "median": 192.5
+            "mean": 158.1,
+            "std": 27.676524348263094,
+            "min": 107.0,
+            "max": 213.0,
+            "median": 153.5
+        },
+        "encouraged_changes": {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "median": 0.0
         },
         "collisions": {
             "mean": 1.0,
@@ -107,31 +43,31 @@
             "median": 1.0
         },
         "average_speed": {
-            "mean": 25.989430170950605,
-            "std": 3.6909359925337495,
-            "min": 19.332700927777093,
-            "max": 33.16291737295823,
-            "median": 25.84051299821169
+            "mean": 25.37510010384226,
+            "std": 3.7317202248532815,
+            "min": 18.198542258795058,
+            "max": 31.107036262971047,
+            "median": 25.694761976332323
         },
         "safe_distance_violations": {
-            "mean": 2.65,
-            "std": 4.563715591489022,
+            "mean": 6.5,
+            "std": 7.060453243241541,
             "min": 0.0,
-            "max": 18.0,
-            "median": 0.0
+            "max": 20.0,
+            "median": 4.0
         },
         "comfort_violations": {
-            "mean": 16.9,
-            "std": 9.098901032542337,
+            "mean": 18.25,
+            "std": 10.606012445778102,
             "min": 0.0,
-            "max": 32.0,
-            "median": 16.0
+            "max": 55.0,
+            "median": 18.0
         },
         "lane_distribution": {
-            "fast_lane": 31.58764088040195,
-            "middle_lane_1": 49.06585566367857,
-            "middle_lane_2": 16.08360352955957,
-            "slow_lane": 3.2628999263598986
+            "fast_lane": 32.66265408270194,
+            "middle_lane_1": 48.016454273333295,
+            "middle_lane_2": 12.868664474802348,
+            "slow_lane": 6.452227169162427
         },
         "completion_rate": {
             "mean": 0.0,
@@ -139,53 +75,6 @@
             "min": 0.0,
             "max": 0.0,
             "median": 0.0
-        }
-    },
-    "comparison": {
-        "episode_reward": {
-            "difference": -7.907076602505157,
-            "percentage_difference": 12.338376750426033,
-            "better_model": "PPO"
-        },
-        "episode_length": {
-            "difference": -34.29999999999998,
-            "percentage_difference": -14.916286149162856,
-            "better_model": "PPO"
-        },
-        "lane_changes": {
-            "difference": 8.85,
-            "percentage_difference": 983.3333333333333,
-            "better_model": "DQN"
-        },
-        "lane_change_attempts": {
-            "difference": 191.2,
-            "percentage_difference": 9560.0,
-            "better_model": "DQN"
-        },
-        "collisions": {
-            "difference": 0.0,
-            "percentage_difference": 0.0,
-            "better_model": "PPO"
-        },
-        "average_speed": {
-            "difference": 3.0250952864580682,
-            "percentage_difference": 13.173015032544525,
-            "better_model": "DQN"
-        },
-        "safe_distance_violations": {
-            "difference": 1.2999999999999998,
-            "percentage_difference": 96.29629629629628,
-            "better_model": "PPO"
-        },
-        "comfort_violations": {
-            "difference": 12.749999999999998,
-            "percentage_difference": 307.22891566265054,
-            "better_model": "PPO"
-        },
-        "completion_rate": {
-            "difference": 0.0,
-            "percentage_difference": Infinity,
-            "better_model": "PPO"
         }
     }
 }
