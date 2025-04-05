@@ -1,790 +1,988 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-优化版SUMO自动驾驶模型评估脚本
-用于评估DQN和PPO两种算法训练的车道变更模型
-"""
-
 import os
 import sys
 import time
+import datetime
 import subprocess
-import socket
+import json
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from tqdm import tqdm
-import random
-import argparse
-import signal
 import torch
-import tensorflow as tf
-from collections import defaultdict
-import warnings
-
-# 抑制不必要的警告
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
-
-# 检查SUMO_HOME环境变量
-if 'SUMO_HOME' not in os.environ:
-    sys.exit("请设置环境变量'SUMO_HOME'")
-tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
-sys.path.append(tools)
-
+import torch.nn as nn
+import torch.nn.functional as F
 import traci
-import sumolib
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import random
+from collections import deque, namedtuple
+from typing import List, Tuple, Dict, Optional, Any
+import socket
+import traceback
+import collections
+import math
+import copy # For deep copying configs/normalizers
 
-# 设置随机种子
-RANDOM_SEED = 42
-np.random.seed(RANDOM_SEED)
-random.seed(RANDOM_SEED)
-tf.random.set_seed(RANDOM_SEED)
-torch.manual_seed(RANDOM_SEED)
+# Solve Chinese garbled characters in matplotlib
+plt.rcParams['font.sans-serif'] = ['SimHei'] # Or 'Microsoft YaHei' etc.
+plt.rcParams['axes.unicode_minus'] = False
 
+# --- Import necessary components from training scripts ---
+try:
+    # Assuming dqn.py and ppo.py are in the same directory or Python path
+    from dqn import Config as DQN_Config
+    from dqn import QNetwork, NoisyLinear, RunningMeanStd as DQN_RunningMeanStd, SumoEnv as DQN_SumoEnv # Use one SumoEnv, but need configs/nets
+    # Note: DQN uses its own RewardNormalizer, not needed directly for evaluation logic but part of env
+    # Note: DQN's agent logic is integrated into the evaluation loop
 
-# 配置类
-class Config:
-    sumo_binary = sumolib.checkBinary("sumo")  # 可改为"sumo-gui"进行可视化
-    config_path = "4.sumocfg"  # 与DQN训练一致，需确保路径正确
+    from ppo import Config as PPO_Config
+    from ppo import PPO, BehaviorCloningNet # BC Net not strictly needed but part of ppo.py
+    from ppo import RunningMeanStd as PPO_RunningMeanStd, SumoEnv as PPO_SumoEnv # Need PPO's Normalizer
+    # Note: PPO uses its own RewardNormalizer, not needed directly for evaluation logic
+    # Note: PPO's agent logic (get_action) is adapted below
 
-    num_episodes = 30
-    max_steps = 1000
-    ego_vehicle_id = "eval_vehicle"
-    port_range = (25000, 26000)
-    step_length = 0.1
+except ImportError as e:
+    print(f"Error importing from dqn.py or ppo.py: {e}")
+    print("Please ensure dqn.py and ppo.py are in the same directory or accessible in the Python path.")
+    sys.exit(1)
 
-    dqn_model_path = None
-    ppo_model_path = None
+#####################################
+# Evaluation Configuration          #
+#####################################
+class EvalConfig:
+    # --- Model Paths ---
+    # IMPORTANT: Update these paths to your saved model files
+    DQN_MODEL_PATH = "dqn.pth" # CHANGE ME
+    PPO_MODEL_PATH = "ppo.pth"              # CHANGE ME
 
-    dqn_state_dim = 22  # 与DQN训练一致
-    ppo_state_dim = 10  # 与PPO训练一致
-    action_dim = 3  # 0:保持 1:左变 2:右变
+    # --- SUMO Configuration ---
+    EVAL_SUMO_BINARY = "sumo"  # Use GUI for visualization during evaluation
+    EVAL_SUMO_CONFIG = "new.sumocfg" # Use the new configuration file
+    EVAL_STEP_LENGTH = 0.2         # Should match training step length
+    EVAL_PORT_RANGE = (8910, 8920) # Use a different port range than training
 
-    metrics = [
-        'avg_speed', 'max_speed', 'avg_acceleration', 'max_acceleration',
-        'avg_jerk', 'lane_changes', 'collisions', 'travel_time',
-        'travel_distance', 'safety_violations', 'center_lane_time',
-        'lane_distribution', 'efficiency_score', 'safety_score',
-        'comfort_score', 'overall_score'
-    ]
+    # --- Evaluation Parameters ---
+    EVAL_EPISODES = 20             # Number of episodes to run for each model
+    EVAL_MAX_STEPS = 1500          # Max steps per evaluation episode (e.g., 300 seconds)
+    EVAL_SEED = 42                 # Seed for reproducibility if needed (applies to SumoEnv start)
+    NUM_LANES = 4                  # Number of lanes in new.net.xml (0, 1, 2, 3)
 
+    # --- Forced Lane Change Attempt Logic ---
+    FORCE_CHANGE_INTERVAL_STEPS = 75 # Attempt a forced change every X steps
+    FORCE_CHANGE_MONITOR_STEPS = 15  # How many steps to wait/monitor for the change to complete
+    FORCE_CHANGE_SUCCESS_DIST = 5.0  # Min distance moved laterally for success check
 
-# 工具函数
-def kill_process_by_port(port):
-    if os.name == 'nt':
-        try:
-            subprocess.run(f"FOR /F \"tokens=5\" %P IN ('netstat -ano ^| findstr {port}') DO taskkill /F /PID %P",
-                           shell=True)
-        except:
-            pass
-    else:
-        try:
-            subprocess.run(f"kill -9 $(lsof -ti tcp:{port})", shell=True)
-        except:
-            pass
+    # --- Normalization ---
+    # Load normalization settings from original configs, but manage state here
+    # Assumes both models used normalization if their respective Config said so.
 
+#####################################
+# Helper Functions (Copied/Adapted) #
+#####################################
+def get_available_port(start_port, end_port):
+    """Find an available port within the specified range"""
+    for port in range(start_port, end_port + 1):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("", port))
+                return port
+            except OSError:
+                continue
+    raise IOError(f"No available port found in the range [{start_port}, {end_port}].")
 
-def is_port_available(port):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    result = True
+def kill_sumo_processes():
+    """Kill any lingering SUMO processes"""
+    killed = False
     try:
-        sock.bind(('127.0.0.1', port))
-    except:
-        result = False
-    sock.close()
-    return result
+        if os.name == 'nt': # Windows
+            result1 = os.system("taskkill /f /im sumo.exe >nul 2>&1")
+            result2 = os.system("taskkill /f /im sumo-gui.exe >nul 2>&1")
+            killed = (result1 == 0 or result2 == 0)
+        else: # Linux/macOS
+            result1 = os.system("pkill -f sumo > /dev/null 2>&1")
+            result2 = os.system("pkill -f sumo-gui > /dev/null 2>&1")
+            killed = (result1 == 0 or result2 == 0)
+    except Exception as e: print(f"Warning: Error terminating SUMO processes: {e}")
+    time.sleep(0.1)
 
+# Use the RunningMeanStd from DQN script (identical to PPO's version)
+RunningMeanStd = DQN_RunningMeanStd
 
-def find_available_port(start_port=20000, end_port=30000):
-    for port in range(start_port, end_port):
-        if is_port_available(port):
-            return port
-    raise RuntimeError("无法找到可用端口")
+#####################################
+# Evaluation Environment Wrapper    #
+#####################################
+# Using a slightly modified SumoEnv, inheriting most from DQN version for consistency
+# Removed reward calculation complexity, focuses on state and execution
+class EvaluationEnv:
+    def __init__(self, eval_config: EvalConfig, sumo_seed: int):
+        self.config = eval_config # Use evaluation config
+        self.sumo_binary = self.config.EVAL_SUMO_BINARY
+        self.config_path = self.config.EVAL_SUMO_CONFIG
+        self.step_length = self.config.EVAL_STEP_LENGTH
+        # Assume ego vehicle ID is the same as in training files
+        self.ego_vehicle_id = DQN_Config.ego_vehicle_id
+        self.ego_type_id = DQN_Config.ego_type_id
+        self.port_range = self.config.EVAL_PORT_RANGE
+        self.num_lanes = self.config.NUM_LANES
+        self.sumo_seed = sumo_seed
 
+        self.sumo_process: Optional[subprocess.Popen] = None
+        self.traci_port: Optional[int] = None
+        self.last_raw_state = np.zeros(DQN_Config.state_dim) # Assuming state dim is same
+        self.current_step = 0
+        self.collision_occurred = False
+        self.ego_start_pos = None
+        self.ego_route_id = "route_E0" # Assumes route ID from new.rou.xml
 
-def kill_all_sumo_instances():
-    if os.name == 'nt':
-        os.system("taskkill /f /im sumo.exe >nul 2>&1")
-        os.system("taskkill /f /im sumo-gui.exe >nul 2>&1")
-    else:
-        os.system("pkill -f sumo")
-        os.system("pkill -f sumo-gui")
+    def _start_sumo(self):
+        kill_sumo_processes()
+        try:
+            self.traci_port = get_available_port(self.port_range[0], self.port_range[1])
+        except IOError as e:
+             print(f"ERROR: Failed to find available port: {e}")
+             sys.exit(1)
 
-
-# PPO模型定义（与训练代码一致）
-class PPOModel(torch.nn.Module):
-    def __init__(self, state_dim=10, hidden_size=512, action_dim=3):
-        super(PPOModel, self).__init__()
-        self.actor = torch.nn.Sequential(
-            torch.nn.Linear(state_dim, hidden_size),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden_size, hidden_size),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden_size, hidden_size),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden_size, action_dim),
-            torch.nn.Softmax(dim=-1)
-        )
-        self.critic = torch.nn.Sequential(
-            torch.nn.Linear(state_dim, hidden_size),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden_size, hidden_size),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden_size, hidden_size),
-            torch.nn.ReLU(),
-            torch.nn.Linear(hidden_size, 1)
-        )
-
-    def forward(self, x):
-        return self.actor(x), self.critic(x)
-
-
-# SUMO评估环境
-class SUMOEvalEnv:
-    def __init__(self, ego_id=None, episode_id=0):
-        self.ego_id = ego_id or f"{Config.ego_vehicle_id}_{episode_id}"
-        self.episode_id = episode_id
-        self.connection_id = None
-        self.step_length = Config.step_length
-        self.max_steps = Config.max_steps
-        self.reset_metrics()
-
-    def reset_metrics(self):
-        self.speed_history = []
-        self.accel_history = [0]
-        self.jerk_history = [0, 0]
-        self.lane_history = []
-        self.lane_changes = 0
-        self.collisions = 0
-        self.safety_violations = 0
-        self.start_time = 0
-        self.travel_distance = 0
-        self.start_position = None
-        self.prev_position = None
-        self.prev_speed = 0
-        self.prev_lane = -1
-        self.step_count = 0
-
-    def start(self):
-        self.close()
-        self.connection_id = f"sim_{self.episode_id}"
         sumo_cmd = [
-            Config.sumo_binary,
-            "-c", Config.config_path,
-            "--num-clients", "1",
-            "--start", "true",
+            self.sumo_binary, "-c", self.config_path,
+            "--remote-port", str(self.traci_port),
             "--step-length", str(self.step_length),
-            "--no-step-log", "true",
-            "--no-warnings", "true",
+            "--collision.check-junctions", "true",
             "--collision.action", "warn",
             "--time-to-teleport", "-1",
-            "--random", "true",
-            "--seed", str(RANDOM_SEED + self.episode_id)
+            "--no-warnings", "true",
+            "--seed", str(self.sumo_seed) # Use provided seed
         ]
-        attempts = 5
-        for _ in range(attempts):
+        if self.sumo_binary == "sumo-gui":
+            sumo_cmd.extend(["--quit-on-end", "false"]) # Keep GUI open after sim ends
+
+        try:
+             stdout_target = subprocess.DEVNULL if self.sumo_binary == "sumo" else None
+             stderr_target = subprocess.DEVNULL if self.sumo_binary == "sumo" else None
+             self.sumo_process = subprocess.Popen(sumo_cmd, stdout=stdout_target, stderr=stderr_target)
+             print(f"Starting SUMO on port {self.traci_port} with seed {self.sumo_seed}...")
+        except FileNotFoundError:
+             print(f"ERROR: SUMO executable '{self.sumo_binary}' not found.")
+             sys.exit(1)
+        except Exception as e:
+             print(f"ERROR: Failed to start SUMO process: {e}")
+             sys.exit(1)
+
+        connection_attempts = 5
+        for attempt in range(connection_attempts):
             try:
-                traci.start(sumo_cmd, label=self.connection_id)
-                traci.switch(self.connection_id)
-                self.add_ego_vehicle()
-                self.reset_metrics()
-                self.start_time = traci.simulation.getTime()
-                return True
+                time.sleep(1.0 + attempt * 0.5)
+                traci.init(self.traci_port)
+                print(f"SUMO TraCI connected (Port: {self.traci_port}).")
+                return
+            except traci.exceptions.TraCIException:
+                if attempt == connection_attempts - 1:
+                    print("Max TraCI connection attempts reached.")
+                    self._close()
+                    raise ConnectionError(f"Could not connect to SUMO (Port: {self.traci_port}).")
             except Exception as e:
-                print(f"启动SUMO失败，尝试重试。错误: {e}")
-                self.close()
-                time.sleep(1)
-        print(f"在{attempts}次尝试后无法启动SUMO，放弃此评估回合")
-        return False
+                print(f"Unexpected error connecting TraCI: {e}")
+                self._close()
+                raise ConnectionError(f"Unknown error connecting to SUMO (Port: {self.traci_port}).")
 
-    def add_ego_vehicle(self):
-        if "ego_route" not in traci.route.getIDList():
-            traci.route.add("ego_route", ["E0"])
-        traci.vehicle.add(
-            self.ego_id, "ego_route",
-            typeID="car",
-            departPos="0",
-            departLane="random",
-            departSpeed="max"
-        )
-        traci.vehicle.setSpeedMode(self.ego_id, 31)
-        traci.vehicle.setLaneChangeMode(self.ego_id, 0)
-        for _ in range(10):
-            traci.simulationStep()
-            if self.ego_id in traci.vehicle.getIDList():
-                self.start_position = traci.vehicle.getPosition(self.ego_id)
-                self.prev_position = self.start_position
-                self.prev_lane = traci.vehicle.getLaneIndex(self.ego_id)
-                break
+    def _add_ego_vehicle(self):
+        """Add the ego vehicle to the simulation using settings from training config"""
+        # Check route (assuming 'route_E0' from new.rou.xml)
+        if self.ego_route_id not in traci.route.getIDList():
+            edge_list = list(traci.edge.getIDList())
+            first_edge = edge_list[0] if edge_list else None
+            if first_edge:
+                print(f"Warning: Route '{self.ego_route_id}' not found. Creating route from first edge '{first_edge}'.")
+                try:
+                    traci.route.add(self.ego_route_id, [first_edge])
+                except traci.exceptions.TraCIException as e:
+                    raise RuntimeError(f"Failed to add route '{self.ego_route_id}' using edge '{first_edge}': {e}")
+            else:
+                raise RuntimeError(f"Route '{self.ego_route_id}' not found and no edges available to create it.")
 
-    def get_dqn_state(self):
-        state = np.zeros(Config.dqn_state_dim)
-        if self.ego_id not in traci.vehicle.getIDList():
-            return state.reshape(1, Config.dqn_state_dim)
 
+        # Check type
+        if self.ego_type_id not in traci.vehicletype.getIDList():
+            try:
+                traci.vehicletype.copy("car", self.ego_type_id) # Copy from default 'car' type in new.rou.xml
+                traci.vehicletype.setParameter(self.ego_type_id, "color", "1,0,0") # Red
+                # Apply key parameters from training config if needed (optional for eval)
+                # traci.vehicletype.setParameter(self.ego_type_id, "lcStrategic", "1.0")
+            except traci.exceptions.TraCIException as e:
+                print(f"Warning: Failed to set parameters for Ego type '{self.ego_type_id}': {e}")
+
+        # Remove residual ego
+        if self.ego_vehicle_id in traci.vehicle.getIDList():
+            try:
+                traci.vehicle.remove(self.ego_vehicle_id); time.sleep(0.1)
+            except traci.exceptions.TraCIException as e: print(f"Warning: Failed to remove residual Ego: {e}")
+
+        # Add ego
         try:
-            ego_lane = traci.vehicle.getLaneIndex(self.ego_id)
-            ego_speed = traci.vehicle.getSpeed(self.ego_id)
-            ego_pos = traci.vehicle.getLanePosition(self.ego_id)
-            ego_lane_id = traci.vehicle.getLaneID(self.ego_id)
-            lane_max_speed = traci.lane.getMaxSpeed(ego_lane_id)
-            norm_speed = ego_speed / max(1.0, lane_max_speed)
-            lane_one_hot = [0, 0, 0]
-            if 0 <= ego_lane < 3:
-                lane_one_hot[ego_lane] = 1
+            start_lane = random.choice(range(self.num_lanes)) # Random start lane
+            traci.vehicle.add(vehID=self.ego_vehicle_id, routeID=self.ego_route_id,
+                              typeID=self.ego_type_id, depart="now",
+                              departLane=start_lane, departSpeed="max")
 
-            leading_vehicle = [0, 100, 0]
-            leader = traci.vehicle.getLeader(self.ego_id)
-            if leader:
-                lead_id, lead_dist = leader
-                if lead_id:
-                    leading_vehicle = [1, lead_dist, traci.vehicle.getSpeed(lead_id) - ego_speed]
+            # Wait for ego to appear
+            wait_steps = int(2.0 / self.step_length)
+            ego_appeared = False
+            for _ in range(wait_steps):
+                traci.simulationStep()
+                if self.ego_vehicle_id in traci.vehicle.getIDList():
+                    ego_appeared = True
+                    self.ego_start_pos = traci.vehicle.getPosition(self.ego_vehicle_id)
+                    break
+            if not ego_appeared:
+                raise RuntimeError(f"Ego vehicle '{self.ego_vehicle_id}' did not appear within {wait_steps} steps.")
 
-            surrounding_vehicles = traci.vehicle.getIDList()
-            following_vehicle = [0, 100, 0]
-            left_leading = [0, 100, 0]
-            left_following = [0, 100, 0]
-            right_leading = [0, 100, 0]
-            right_following = [0, 100, 0]
+        except traci.exceptions.TraCIException as e:
+            print(f"ERROR: Failed to add Ego vehicle '{self.ego_vehicle_id}': {e}")
+            raise RuntimeError("Failed adding Ego vehicle.")
 
-            for v_id in surrounding_vehicles:
-                if v_id != self.ego_id:
-                    v_lane = traci.vehicle.getLaneIndex(v_id)
-                    v_pos = traci.vehicle.getLanePosition(v_id)
-                    v_speed = traci.vehicle.getSpeed(v_id)
-                    rel_pos = v_pos - ego_pos
-                    if v_lane == ego_lane and rel_pos < 0:
-                        dist = abs(rel_pos)
-                        if dist < following_vehicle[1]:
-                            following_vehicle = [1, dist, v_speed - ego_speed]
-                    if ego_lane > 0 and v_lane == ego_lane - 1:
-                        if rel_pos > 0 and rel_pos < left_leading[1]:
-                            left_leading = [1, rel_pos, v_speed - ego_speed]
-                        elif rel_pos < 0 and abs(rel_pos) < left_following[1]:
-                            left_following = [1, abs(rel_pos), v_speed - ego_speed]
-                    if ego_lane < 2 and v_lane == ego_lane + 1:
-                        if rel_pos > 0 and rel_pos < right_leading[1]:
-                            right_leading = [1, rel_pos, v_speed - ego_speed]
-                        elif rel_pos < 0 and abs(rel_pos) < right_following[1]:
-                            right_following = [1, abs(rel_pos), v_speed - ego_speed]
+    def reset(self) -> np.ndarray:
+        """Reset environment for a new evaluation episode"""
+        self._close()
+        self._start_sumo()
+        self._add_ego_vehicle()
+        self.current_step = 0
+        self.collision_occurred = False
+        self.last_raw_state = np.zeros(DQN_Config.state_dim)
 
-            state = [
-                norm_speed,
-                *lane_one_hot,
-                *leading_vehicle,
-                *following_vehicle,
-                *left_leading,
-                *left_following,
-                *right_leading,
-                *right_following
-            ]
-        except:
-            pass
+        if self.ego_vehicle_id in traci.vehicle.getIDList():
+            try:
+                raw_state = self._get_raw_state()
+                self.last_raw_state = raw_state.copy()
+            except traci.exceptions.TraCIException:
+                 print("Warning: TraCI exception during initial state fetch in reset.")
+        else:
+             print("Warning: Ego vehicle not found immediately after add/wait in reset.")
 
-        return np.array(state).reshape(1, Config.dqn_state_dim)
+        return self.last_raw_state
 
-    def get_ppo_state(self):
-        state = np.zeros(Config.ppo_state_dim, dtype=np.float32)
-        if self.ego_id not in traci.vehicle.getIDList():
-            return state
+    # Reusing _get_surrounding_vehicle_info logic from dqn.py (identical to ppo.py)
+    def _get_surrounding_vehicle_info(self, ego_id: str, ego_speed: float, ego_pos: tuple, ego_lane: int) -> Dict[str, Tuple[float, float]]:
+        """Get distance and relative speed of nearest vehicles (copied from dqn.py)"""
+        max_dist = DQN_Config.max_distance # Use distance from a config
+        infos = {
+            'front': (max_dist, 0.0), 'left_front': (max_dist, 0.0),
+            'left_back': (max_dist, 0.0), 'right_front': (max_dist, 0.0),
+            'right_back': (max_dist, 0.0)
+        }
+        veh_ids = traci.vehicle.getIDList()
+        if ego_id not in veh_ids: return infos
 
-        try:
-            speed = traci.vehicle.getSpeed(self.ego_id)
-            lane = traci.vehicle.getLaneIndex(self.ego_id)
-            state[0] = speed / 33.33
-            state[1] = lane / 2.0
+        ego_road = traci.vehicle.getRoadID(ego_id)
+        if not ego_road: return infos # Check if on a road
 
-            ego_pos = traci.vehicle.getPosition(self.ego_id)
-            ranges = {
-                'front': (100.0, -1),
-                'back': (100.0, -1),
-                'left_front': (100.0, -1),
-                'left_back': (100.0, -1),
-                'right_front': (100.0, -1),
-                'right_back': (100.0, -1)
-            }
+        # Get number of lanes on current edge dynamically if needed, or use EvalConfig.NUM_LANES
+        # num_lanes_on_edge = traci.edge.getLaneNumber(ego_road)
 
-            for veh_id in traci.vehicle.getIDList():
-                if veh_id == self.ego_id:
-                    continue
+        for veh_id in veh_ids:
+            if veh_id == ego_id: continue
+            try:
+                # Check if the vehicle is on the same edge first
+                veh_road = traci.vehicle.getRoadID(veh_id)
+                if veh_road != ego_road: continue
+
+                veh_pos = traci.vehicle.getPosition(veh_id)
                 veh_lane = traci.vehicle.getLaneIndex(veh_id)
-                dx = traci.vehicle.getPosition(veh_id)[0] - ego_pos[0]
-                dy = traci.vehicle.getPosition(veh_id)[1] - ego_pos[1]
-                distance = np.hypot(dx, dy)
-                if veh_lane == lane - 1:
-                    key = 'left_front' if dx > 0 else 'left_back'
-                elif veh_lane == lane + 1:
-                    key = 'right_front' if dx > 0 else 'right_back'
-                elif veh_lane == lane:
-                    key = 'front' if dx > 0 else 'back'
-                else:
-                    continue
-                if distance < ranges[key][0]:
-                    ranges[key] = (distance, veh_id)
+                veh_speed = traci.vehicle.getSpeed(veh_id)
+                # Simple longitudinal distance assumption for state
+                dx = veh_pos[0] - ego_pos[0]
+                # Lateral distance check might be useful too: dy = veh_pos[1] - ego_pos[1]
+                distance = abs(dx) # Use longitudinal distance for state representation consistency
 
-            state[2] = ranges['front'][0] / 100.0
-            state[3] = ranges['back'][0] / 100.0
-            state[4] = ranges['left_front'][0] / 100.0
-            state[5] = ranges['left_back'][0] / 100.0
-            state[6] = ranges['right_front'][0] / 100.0
-            state[7] = ranges['right_back'][0] / 100.0
+                if distance >= max_dist: continue
+                rel_speed = ego_speed - veh_speed # Positive if ego is faster
 
-            state[8] = state[1]
-            state[9] = 1.0 if lane == 1 else 0.0
-        except:
-            pass
+                # Determine relative position based on lanes and dx
+                if veh_lane == ego_lane: # Same lane
+                    if dx > 0 and distance < infos['front'][0]: infos['front'] = (distance, rel_speed)
+                    # Ignore vehicles directly behind in same lane for this state representation
+                elif veh_lane == ego_lane - 1: # Left lane
+                    if dx > -5 and distance < infos['left_front'][0]: # Check vehicles slightly behind to front
+                        infos['left_front'] = (distance, rel_speed)
+                    elif dx <= -5 and distance < infos['left_back'][0]: # Check vehicles further behind
+                        infos['left_back'] = (distance, rel_speed)
+                elif veh_lane == ego_lane + 1: # Right lane
+                     if dx > -5 and distance < infos['right_front'][0]:
+                        infos['right_front'] = (distance, rel_speed)
+                     elif dx <= -5 and distance < infos['right_back'][0]:
+                        infos['right_back'] = (distance, rel_speed)
+            except traci.exceptions.TraCIException:
+                continue # Skip vehicle if TraCI error occurs
+        return infos
+
+    # Reusing _get_raw_state logic from dqn.py
+    def _get_raw_state(self) -> np.ndarray:
+        """Get the current environment state (RAW values before normalization, copied from dqn.py)"""
+        state = np.zeros(DQN_Config.state_dim, dtype=np.float32)
+        ego_id = self.ego_vehicle_id
+
+        if ego_id not in traci.vehicle.getIDList():
+            return self.last_raw_state # Return last known raw state if ego vanished
+
+        try:
+            current_road = traci.vehicle.getRoadID(ego_id)
+            if not current_road:
+                return self.last_raw_state # Not on a road
+
+            ego_speed = traci.vehicle.getSpeed(ego_id)
+            ego_lane = traci.vehicle.getLaneIndex(ego_id)
+            ego_pos = traci.vehicle.getPosition(ego_id)
+            num_lanes = self.num_lanes # Use known number of lanes
+
+            # Ensure ego_lane is valid
+            if not (0 <= ego_lane < num_lanes):
+                 print(f"Warning: Invalid ego lane {ego_lane} detected. Clipping.")
+                 ego_lane = np.clip(ego_lane, 0, num_lanes - 1)
+
+            # Check lane change possibility (TraCI handles boundary checks internally)
+            can_change_left = traci.vehicle.couldChangeLane(ego_id, -1)
+            can_change_right = traci.vehicle.couldChangeLane(ego_id, 1)
+
+            surround_info = self._get_surrounding_vehicle_info(ego_id, ego_speed, ego_pos, ego_lane)
+
+            # --- Raw State Features (Matches training state) ---
+            state[0] = ego_speed
+            state[1] = float(ego_lane)
+            state[2] = min(surround_info['front'][0], DQN_Config.max_distance)
+            state[3] = surround_info['front'][1]
+            state[4] = min(surround_info['left_front'][0], DQN_Config.max_distance)
+            state[5] = surround_info['left_front'][1]
+            state[6] = min(surround_info['left_back'][0], DQN_Config.max_distance)
+            state[7] = min(surround_info['right_front'][0], DQN_Config.max_distance)
+            state[8] = surround_info['right_front'][1]
+            state[9] = min(surround_info['right_back'][0], DQN_Config.max_distance)
+            state[10] = 1.0 if can_change_left else 0.0
+            state[11] = 1.0 if can_change_right else 0.0
+
+            if np.any(np.isnan(state)) or np.any(np.isinf(state)):
+                print(f"Warning: NaN or Inf detected in raw state calculation. Using last valid raw state.")
+                return self.last_raw_state
+
+            self.last_raw_state = state.copy() # Store the latest valid raw state
+
+        except traci.exceptions.TraCIException as e:
+            if "Vehicle '" + ego_id + "' is not known" in str(e): pass # Expected near end
+            else: print(f"Warning: TraCI error getting raw state for {ego_id}: {e}. Returning last known raw state.")
+            return self.last_raw_state
+        except Exception as e:
+            print(f"Warning: Unknown error getting raw state for {ego_id}: {e}. Returning last known raw state.")
+            traceback.print_exc()
+            return self.last_raw_state
 
         return state
 
-    def step_dqn(self, action):
-        if self.ego_id not in traci.vehicle.getIDList():
-            return -100, True
-
-        old_lane = traci.vehicle.getLaneIndex(self.ego_id)
-        collision = False
-
-        try:
-            if action == 1 and old_lane > 0:
-                traci.vehicle.changeLane(self.ego_id, old_lane - 1, 5)  # 与DQN训练一致
-            elif action == 2 and old_lane < 2:
-                traci.vehicle.changeLane(self.ego_id, old_lane + 1, 5)
-
-            current_speed = traci.vehicle.getSpeed(self.ego_id)
-            lane_id = traci.vehicle.getLaneID(self.ego_id)
-            max_lane_speed = traci.lane.getMaxSpeed(lane_id)
-            desired_speed = min(max_lane_speed, current_speed + 1)
-            traci.vehicle.setSpeed(self.ego_id, desired_speed)
-
-            for _ in range(5):
-                traci.simulationStep()
-                self.update_metrics()
-                if self.check_collision():
-                    collision = True
-                    break
-                if self.ego_id not in traci.vehicle.getIDList():
-                    break
-        except:
-            collision = True
-
-        new_lane = traci.vehicle.getLaneIndex(self.ego_id) if self.ego_id in traci.vehicle.getIDList() else old_lane
-        if new_lane != old_lane and new_lane != -1 and old_lane != -1:
-            self.lane_changes += 1
-
-        reward = -150 if collision else (1 if old_lane != new_lane else 0.1)
-        done = collision or self.step_count >= self.max_steps
-        if done and not collision and self.ego_id in traci.vehicle.getIDList():
-            reward += 10
-
-        return reward, done
-
-    def step_ppo(self, action):
-        if self.ego_id not in traci.vehicle.getIDList():
-            return -50, True
-
-        reward = 0.0
+    def step(self, action: int) -> Tuple[np.ndarray, bool]:
+        """Execute action, return (next_raw_state, done)"""
         done = False
-        old_lane = traci.vehicle.getLaneIndex(self.ego_id)
+        ego_id = self.ego_vehicle_id
+
+        if ego_id not in traci.vehicle.getIDList():
+             self.collision_occurred = True # Assume collision if missing at step start
+             return self.last_raw_state, True
 
         try:
-            if action == 1 and old_lane > 0:
-                traci.vehicle.changeLane(self.ego_id, old_lane - 1, 2)  # 与PPO训练一致
-            elif action == 2 and old_lane < 2:
-                traci.vehicle.changeLane(self.ego_id, old_lane + 1, 2)
+            current_lane = traci.vehicle.getLaneIndex(ego_id)
+            num_lanes = self.num_lanes
 
+            # Ensure current_lane is valid before action execution
+            if not (0 <= current_lane < num_lanes):
+                 current_lane = np.clip(current_lane, 0, num_lanes - 1)
+
+            # 1. Execute Action
+            if action == 1 and current_lane > 0: # Try Left
+                traci.vehicle.changeLane(ego_id, current_lane - 1, duration=1.0)
+            elif action == 2 and current_lane < (num_lanes - 1): # Try Right
+                traci.vehicle.changeLane(ego_id, current_lane + 1, duration=1.0)
+            # Action 0: Keep lane (do nothing explicit)
+
+            # 2. Simulation Step
             traci.simulationStep()
-            self.update_metrics()
+            self.current_step += 1
 
-            if self.check_collision():
-                return -50.0, True
-
-            new_lane = traci.vehicle.getLaneIndex(self.ego_id)
-            if new_lane != old_lane and new_lane != -1 and old_lane != -1:
-                self.lane_changes += 1
-
-            speed = traci.vehicle.getSpeed(self.ego_id)
-            reward += (speed / 33.33) * 0.3
-            lane = traci.vehicle.getLaneIndex(self.ego_id)
-            reward += (2 - abs(lane - 1)) * 0.2
-            if action != 0:
-                reward += 0.2
-        except:
-            done = True
-
-        done = done or self.step_count >= self.max_steps
-        return reward, done
-
-    def update_metrics(self):
-        if self.ego_id not in traci.vehicle.getIDList():
-            return
-
-        try:
-            speed = traci.vehicle.getSpeed(self.ego_id)
-            position = traci.vehicle.getPosition(self.ego_id)
-            lane = traci.vehicle.getLaneIndex(self.ego_id)
-
-            accel = (speed - self.prev_speed) / max(0.1, self.step_length)
-            jerk = (accel - self.accel_history[-1]) / max(0.1, self.step_length) if self.accel_history else 0
-
-            self.speed_history.append(speed)
-            self.accel_history.append(accel)
-            self.jerk_history.append(jerk)
-            self.lane_history.append(lane)
-
-            if self.prev_position:
-                dx = position[0] - self.prev_position[0]
-                dy = position[1] - self.prev_position[1]
-                self.travel_distance += np.hypot(dx, dy)
-
-            if traci.vehicle.getLeader(self.ego_id):
-                _, lead_dist = traci.vehicle.getLeader(self.ego_id)
-                if lead_dist < speed * 1.5:
-                    self.safety_violations += 1
-
-            self.prev_speed = speed
-            self.prev_position = position
-            self.step_count += 1
-        except:
-            pass
-
-    def check_collision(self):
-        if self.ego_id not in traci.vehicle.getIDList():
-            return True
-        collision_list = traci.simulation.getCollidingVehiclesIDList()
-        if collision_list and self.ego_id in collision_list:
-            self.collisions += 1
-            return True
-        return False
-
-    def get_metrics(self):
-        metrics = {
-            'avg_speed': np.mean(self.speed_history) if self.speed_history else 0,
-            'max_speed': np.max(self.speed_history) if self.speed_history else 0,
-            'avg_acceleration': np.mean(np.abs(self.accel_history[1:])) if len(self.accel_history) > 1 else 0,
-            'max_acceleration': np.max(np.abs(self.accel_history[1:])) if len(self.accel_history) > 1 else 0,
-            'avg_jerk': np.mean(np.abs(self.jerk_history[2:])) if len(self.jerk_history) > 2 else 0,
-            'lane_changes': self.lane_changes,
-            'collisions': self.collisions,
-            'travel_time': traci.simulation.getTime() - self.start_time if self.start_time > 0 else 0,
-            'travel_distance': self.travel_distance,
-            'safety_violations': self.safety_violations,
-            'center_lane_time': self.lane_history.count(1) / len(self.lane_history) if self.lane_history else 0,
-            'lane_distribution': {lane: self.lane_history.count(lane) / len(self.lane_history) for lane in
-                                  set(self.lane_history)} if self.lane_history else {},
-            'efficiency_score': 0,
-            'safety_score': 0,
-            'comfort_score': 0,
-            'overall_score': 0
-        }
-
-        if metrics['avg_speed'] > 0:
-            metrics['efficiency_score'] = min(10, (metrics['avg_speed'] / 33.33) * 10)
-            if metrics['travel_time'] > 0:
-                metrics['efficiency_score'] -= min(5, metrics['travel_time'] / 200)
-            metrics['efficiency_score'] -= min(3, metrics['lane_changes'] * 0.2)
-
-        metrics['safety_score'] = 10 - metrics['collisions'] * 10 - min(5, metrics['safety_violations'] * 0.1)
-        metrics['comfort_score'] = 10 - min(5, metrics['avg_acceleration']) - min(5, metrics['avg_jerk'] * 2)
-        metrics['overall_score'] = (
-                0.4 * max(0, metrics['safety_score']) +
-                0.4 * max(0, metrics['efficiency_score']) +
-                0.2 * max(0, metrics['comfort_score'])
-        )
-
-        for score in ['safety_score', 'efficiency_score', 'comfort_score', 'overall_score']:
-            metrics[score] = max(0, min(10, metrics[score]))
-
-        return metrics
-
-    def close(self):
-        try:
-            if traci.isLoaded():
-                traci.close()
-        except:
-            pass
-        time.sleep(0.2)
-
-
-# DQN代理类
-class DQNAgent:
-    def __init__(self, model_path):
-        self.model = tf.keras.models.load_model(model_path)
-
-    def act(self, state):
-        q_values = self.model.predict(state, verbose=0)
-        return np.argmax(q_values[0])
-
-
-# PPO代理类
-class PPOAgent:
-    def __init__(self, model_path):
-        self.model = PPOModel()
-        self.model.load_state_dict(torch.load(model_path))
-        self.model.eval()
-
-    def act(self, state):
-        with torch.no_grad():
-            state_tensor = torch.FloatTensor(state)
-            probs, _ = self.model(state_tensor)
-            lane = int(state[1] * 2)
-            mask = torch.ones(3)
-            if lane == 0:
-                mask[1] = 0.0
-            elif lane == 2:
-                mask[2] = 0.0
-            probs = probs * mask
-            if probs.sum() > 0:
-                probs = probs / probs.sum()
-                return torch.argmax(probs).item()
-            return 0
-
-
-# 评估函数
-def evaluate_agent(agent_type, agent, num_episodes):
-    print(f"开始评估 {agent_type} 模型...")
-    all_metrics = []
-
-    for episode in tqdm(range(num_episodes), desc=f"评估 {agent_type}"):
-        env = SUMOEvalEnv(episode_id=episode)
-        if not env.start():
-            continue
-
-        done = False
-        total_reward = 0
-
-        while not done:
-            if agent_type == 'DQN':
-                state = env.get_dqn_state()
-                action = agent.act(state)
-                reward, done = env.step_dqn(action)
-            else:
-                state = env.get_ppo_state()
-                action = agent.act(state)
-                reward, done = env.step_ppo(action)
-            total_reward += reward
-
-            if env.step_count >= Config.max_steps:
+            # 3. Check Status AFTER step
+            if ego_id not in traci.vehicle.getIDList():
+                self.collision_occurred = True
                 done = True
+                next_raw_state = self.last_raw_state # Return last known state
+                return next_raw_state, done
 
-        metrics = env.get_metrics()
-        metrics['episode'] = episode
-        metrics['total_reward'] = total_reward
-        all_metrics.append(metrics)
-        env.close()
+            # Check SUMO collision list
+            collisions = traci.simulation.getCollisions()
+            for col in collisions:
+                if col.collider == ego_id or col.victim == ego_id:
+                    self.collision_occurred = True
+                    done = True
+                    break # No need to check further
 
-        if (episode + 1) % 10 == 0 or episode == num_episodes - 1:
-            avg_reward = np.mean([m['total_reward'] for m in all_metrics[-10:]])
-            avg_score = np.mean([m['overall_score'] for m in all_metrics[-10:]])
-            print(f"回合 {episode + 1}/{num_episodes}, 平均奖励: {avg_reward:.2f}, 平均得分: {avg_score:.2f}")
+            # Get next state (raw)
+            next_raw_state = self._get_raw_state()
 
-    avg_metrics = {}
-    for metric in Config.metrics + ['total_reward']:
-        if metric == 'lane_distribution':
-            lane_dist = {}
-            for m in all_metrics:
-                for lane, pct in m.get('lane_distribution', {}).items():
-                    lane_dist[lane] = lane_dist.get(lane, 0) + pct
-            total = sum(lane_dist.values())
-            avg_metrics['lane_distribution'] = {lane: val / total for lane, val in
-                                                lane_dist.items()} if total > 0 else {}
+            # Check other termination conditions
+            if traci.simulation.getTime() >= 3600: done = True # Sim time limit
+            if self.current_step >= self.config.EVAL_MAX_STEPS: done = True # Eval step limit
+
+        except traci.exceptions.TraCIException as e:
+            if "Vehicle '" + ego_id + "' is not known" in str(e):
+                self.collision_occurred = True # Assume collision if vehicle disappears during step
+            else: print(f"ERROR: TraCI exception during step {self.current_step}: {e}")
+            done = True
+            next_raw_state = self.last_raw_state
+        except Exception as e:
+            print(f"ERROR: Unknown exception during step {self.current_step}: {e}")
+            traceback.print_exc()
+            done = True
+            self.collision_occurred = True # Assume collision on unknown error
+            next_raw_state = self.last_raw_state
+
+        # Return RAW state and done flag
+        return next_raw_state, done
+
+    def get_vehicle_info(self):
+        """Get current info like speed, lane, position"""
+        ego_id = self.ego_vehicle_id
+        if ego_id in traci.vehicle.getIDList():
+            try:
+                speed = traci.vehicle.getSpeed(ego_id)
+                lane = traci.vehicle.getLaneIndex(ego_id)
+                pos = traci.vehicle.getPosition(ego_id)
+                dist_traveled = math.dist(pos, self.ego_start_pos) if self.ego_start_pos else 0.0
+                return {"speed": speed, "lane": lane, "pos": pos, "dist": dist_traveled}
+            except traci.exceptions.TraCIException:
+                return {"speed": 0, "lane": -1, "pos": (0,0), "dist": 0}
         else:
-            values = [m.get(metric, 0) for m in all_metrics]
-            avg_metrics[metric] = np.mean(values) if values else 0
+            return {"speed": 0, "lane": -1, "pos": (0,0), "dist": 0}
 
-    return avg_metrics, all_metrics
+    def _close(self):
+        """Close SUMO instance"""
+        if self.sumo_process:
+            try:
+                traci.close()
+            except Exception: pass
+            finally:
+                try:
+                    if self.sumo_process.poll() is None:
+                        self.sumo_process.terminate()
+                        self.sumo_process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.sumo_process.kill()
+                    self.sumo_process.wait(timeout=1)
+                except Exception as e: print(f"Warning: Error during SUMO termination: {e}")
+                self.sumo_process = None
+                self.traci_port = None
+                time.sleep(0.1)
+        else:
+            self.traci_port = None
 
+#####################################
+# Model Loading and Action Selection #
+#####################################
 
-# 创建比较图表
-def create_comparison_charts(dqn_metrics, ppo_metrics, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
-    plt.rcParams['axes.unicode_minus'] = False
+def load_model(model_path: str, model_type: str, config: Any, device: torch.device) -> nn.Module:
+    """Loads a trained model (DQN or PPO)."""
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
 
-    dqn_avg, dqn_all = dqn_metrics
-    ppo_avg, ppo_all = ppo_metrics
+    if model_type == 'dqn':
+        # Ensure config is an instance of DQN_Config
+        if not isinstance(config, DQN_Config): # CORRECTED CHECK
+             # Add a print statement to see what type it actually is, for debugging
+             print(f"Debug: Expected DQN_Config, but got type: {type(config)}")
+             raise TypeError("Provided config is not an instance of DQN_Config for DQN model")
+        model = QNetwork(config.state_dim, config.action_dim, config.hidden_size, config).to(device)
+    elif model_type == 'ppo':
+        # Ensure config is an instance of PPO_Config
+        if not isinstance(config, PPO_Config): # CORRECTED CHECK
+             # Add a print statement for debugging
+             print(f"Debug: Expected PPO_Config, but got type: {type(config)}")
+             raise TypeError("Provided config is not an instance of PPO_Config for PPO model")
+        model = PPO(config.state_dim, config.action_dim, config.hidden_size).to(device)
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
 
-    metrics_df = pd.DataFrame({
-        'DQN': [dqn_avg[m] for m in Config.metrics if m != 'lane_distribution'],
-        'PPO': [ppo_avg[m] for m in Config.metrics if m != 'lane_distribution'],
-        'Metric': [m for m in Config.metrics if m != 'lane_distribution']
-    })
-
-    plt.figure(figsize=(15, 12))
-
-    plt.subplot(3, 1, 1)
-    speed_metrics = ['avg_speed', 'max_speed', 'travel_distance']
-    speed_df = metrics_df[metrics_df['Metric'].isin(speed_metrics)]
-    speed_melted = pd.melt(speed_df, id_vars=['Metric'], value_vars=['DQN', 'PPO'])
-    sns.barplot(x='Metric', y='value', hue='variable', data=speed_melted)
-    plt.title('速度和距离指标比较')
-    plt.ylabel('值')
-
-    plt.subplot(3, 1, 2)
-    safety_metrics = ['collisions', 'safety_violations', 'lane_changes']
-    safety_df = metrics_df[metrics_df['Metric'].isin(safety_metrics)]
-    safety_melted = pd.melt(safety_df, id_vars=['Metric'], value_vars=['DQN', 'PPO'])
-    sns.barplot(x='Metric', y='value', hue='variable', data=safety_melted)
-    plt.title('安全指标比较')
-    plt.ylabel('次数')
-
-    plt.subplot(3, 1, 3)
-    score_metrics = ['safety_score', 'efficiency_score', 'comfort_score', 'overall_score']
-    score_df = metrics_df[metrics_df['Metric'].isin(score_metrics)]
-    score_melted = pd.melt(score_df, id_vars=['Metric'], value_vars=['DQN', 'PPO'])
-    sns.barplot(x='Metric', y='value', hue='variable', data=score_melted)
-    plt.title('综合得分比较')
-    plt.ylabel('得分 (0-10)')
-    plt.ylim(0, 10)
-
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/metrics_comparison.png")
-    plt.close()
-
-    plt.figure(figsize=(10, 6))
-    dqn_lane_dist = dqn_avg.get('lane_distribution', {})
-    ppo_lane_dist = ppo_avg.get('lane_distribution', {})
-    dqn_lanes = sorted(dqn_lane_dist.keys())
-    ppo_lanes = sorted(ppo_lane_dist.keys())
-    dqn_values = [dqn_lane_dist.get(lane, 0) for lane in dqn_lanes]
-    ppo_values = [ppo_lane_dist.get(lane, 0) for lane in ppo_lanes]
-
-    width = 0.35
-    plt.bar(np.array(dqn_lanes) - width / 2, dqn_values, width, label='DQN')
-    plt.bar(np.array(ppo_lanes) + width / 2, ppo_values, width, label='PPO')
-    plt.xlabel('车道')
-    plt.ylabel('使用比例')
-    plt.title('车道使用分布比较')
-    plt.xticks(range(3))
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/lane_distribution.png")
-    plt.close()
-
-    categories = ['速度', '安全性', '效率', '舒适度', '车道保持']
-    dqn_values = [
-        min(10, (dqn_avg['avg_speed'] / 33.33) * 10),
-        dqn_avg['safety_score'],
-        dqn_avg['efficiency_score'],
-        dqn_avg['comfort_score'],
-        min(10, dqn_avg['center_lane_time'] * 10)
-    ]
-    ppo_values = [
-        min(10, (ppo_avg['avg_speed'] / 33.33) * 10),
-        ppo_avg['safety_score'],
-        ppo_avg['efficiency_score'],
-        ppo_avg['comfort_score'],
-        min(10, ppo_avg['center_lane_time'] * 10)
-    ]
-
-    angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
-    angles += angles[:1]
-    dqn_values += dqn_values[:1]
-    ppo_values += ppo_values[:1]
-
-    fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(polar=True))
-    ax.plot(angles, dqn_values, 'b-', linewidth=2, label='DQN')
-    ax.fill(angles, dqn_values, 'b', alpha=0.1)
-    ax.plot(angles, ppo_values, 'r-', linewidth=2, label='PPO')
-    ax.fill(angles, ppo_values, 'r', alpha=0.1)
-    ax.set_thetagrids(np.degrees(angles[:-1]), categories)
-    ax.set_ylim(0, 10)
-    ax.set_title("模型性能雷达图")
-    ax.legend(loc='upper right')
-    plt.savefig(f"{output_dir}/radar_comparison.png")
-    plt.close()
-
-    comparison_df = pd.DataFrame({
-        'Metric': [m for m in Config.metrics if m != 'lane_distribution'],
-        'DQN': [dqn_avg[m] for m in Config.metrics if m != 'lane_distribution'],
-        'PPO': [ppo_avg[m] for m in Config.metrics if m != 'lane_distribution'],
-        'Difference': [dqn_avg[m] - ppo_avg[m] for m in Config.metrics if m != 'lane_distribution'],
-        'Percent_Difference': [
-            (dqn_avg[m] - ppo_avg[m]) / max(0.001, ppo_avg[m]) * 100
-            for m in Config.metrics if m != 'lane_distribution'
-        ]
-    })
-
-    comparison_df.to_csv(f"{output_dir}/comparison_results.csv", index=False)
-    pd.DataFrame(dqn_all).to_csv(f"{output_dir}/dqn_detailed_results.csv", index=False)
-    pd.DataFrame(ppo_all).to_csv(f"{output_dir}/ppo_detailed_results.csv", index=False)
-
-    return comparison_df
-
-
-# 主函数
-def main():
-    parser = argparse.ArgumentParser(description='评估DQN和PPO车道变更模型')
-    parser.add_argument('--dqn-model', type=str, required=True, help='DQN模型路径 (.keras)')
-    parser.add_argument('--ppo-model', type=str, required=True, help='PPO模型路径 (.pth)')
-    parser.add_argument('--episodes', type=int, default=Config.num_episodes, help='评估回合数')
-    parser.add_argument('--output-dir', type=str, default='./evaluation_results', help='输出目录')
-    parser.add_argument('--visual', action='store_true', help='使用SUMO-GUI可视化')
-
-    args = parser.parse_args()
-
-    Config.dqn_model_path = args.dqn_model
-    Config.ppo_model_path = args.ppo_model
-    Config.num_episodes = args.episodes
-    if args.visual:
-        Config.sumo_binary = sumolib.checkBinary('sumo-gui')
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    kill_all_sumo_instances()
-    time.sleep(1)
-
-    def signal_handler(sig, frame):
-        print('接收到中断信号，正在清理...')
-        kill_all_sumo_instances()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, signal_handler)
-
-    print(f"开始评估，每种模型 {Config.num_episodes} 个回合...")
     try:
-        print("加载DQN模型...")
-        dqn_agent = DQNAgent(Config.dqn_model_path)
-
-        print("加载PPO模型...")
-        ppo_agent = PPOAgent(Config.ppo_model_path)
-
-        print("评估DQN模型...")
-        dqn_metrics = evaluate_agent('DQN', dqn_agent, Config.num_episodes)
-
-        kill_all_sumo_instances()
-        time.sleep(1)
-
-        print("评估PPO模型...")
-        ppo_metrics = evaluate_agent('PPO', ppo_agent, Config.num_episodes)
-
-        print("创建比较图表...")
-        comparison_df = create_comparison_charts(dqn_metrics, ppo_metrics, args.output_dir)
-
-        print("\n评估完成！结果摘要:")
-        print("-" * 60)
-        print(f"{'指标':<20} {'DQN':<10} {'PPO':<10} {'差值':<10}")
-        print("-" * 60)
-        key_metrics = ['avg_speed', 'collisions', 'lane_changes', 'safety_score',
-                       'efficiency_score', 'comfort_score', 'overall_score']
-        for metric in key_metrics:
-            dqn_value = dqn_metrics[0][metric]
-            ppo_value = ppo_metrics[0][metric]
-            diff = dqn_value - ppo_value
-            print(f"{metric:<20} {dqn_value:<10.2f} {ppo_value:<10.2f} {diff:<10.2f}")
-        print("-" * 60)
-        print(f"综合得分: DQN: {dqn_metrics[0]['overall_score']:.2f}, PPO: {ppo_metrics[0]['overall_score']:.2f}")
-        winner = "DQN" if dqn_metrics[0]['overall_score'] > ppo_metrics[0]['overall_score'] else "PPO"
-        print(f"在此评估中，{winner} 模型整体表现更好。")
-        print(f"详细结果保存在 {args.output_dir}/ 目录中")
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.eval() # Set to evaluation mode
+        print(f"Successfully loaded {model_type.upper()} model from: {model_path}")
+        return model
     except Exception as e:
-        print(f"评估过程中出错: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        kill_all_sumo_instances()
+        print(f"Error loading model state_dict from {model_path}: {e}")
+        raise
 
+def normalize_state(state_raw: np.ndarray, normalizer: Optional[RunningMeanStd], clip_val: float) -> np.ndarray:
+    """Normalizes state using the provided normalizer instance."""
+    if normalizer:
+        # Update normalizer stats during evaluation (suboptimal but necessary if not saved)
+        # Use a copy to avoid modifying the original normalizer across models if shared
+        temp_normalizer = copy.deepcopy(normalizer)
+        temp_normalizer.update(state_raw.reshape(1, -1)) # Update with single observation
+
+        norm_state = (state_raw - temp_normalizer.mean) / (temp_normalizer.std + 1e-8)
+        norm_state = np.clip(norm_state, -clip_val, clip_val)
+        return norm_state.astype(np.float32), temp_normalizer # Return updated normalizer
+    else:
+        return state_raw.astype(np.float32), normalizer # Return raw state if no normalizer
+
+def get_dqn_action(model: QNetwork, state_norm: np.ndarray, current_lane_idx: int, config: DQN_Config, device: torch.device) -> int:
+    """Get action from DQN model (C51/Noisy aware)."""
+    model.eval() # Ensure eval mode
+
+    # Reset noise if using Noisy Nets
+    if config.use_noisy_nets:
+        for module in model.modules():
+            if isinstance(module, NoisyLinear):
+                module.reset_noise()
+
+    with torch.no_grad():
+        state_tensor = torch.FloatTensor(state_norm).unsqueeze(0).to(device)
+        action_probs = model(state_tensor) # Output: [1, action_dim, num_atoms]
+        support = torch.linspace(config.v_min, config.v_max, config.num_atoms).to(device)
+        expected_q_values = (action_probs * support).sum(dim=2) # [1, action_dim]
+
+        # Action Masking
+        q_values_masked = expected_q_values.clone()
+        if current_lane_idx == 0:
+            q_values_masked[0, 1] = -float('inf') # Cannot turn left from lane 0
+        if current_lane_idx >= EvalConfig.NUM_LANES - 1:
+            q_values_masked[0, 2] = -float('inf') # Cannot turn right from last lane
+
+        action = q_values_masked.argmax().item()
+    return action
+
+def get_ppo_action(model: PPO, state_norm: np.ndarray, current_lane_idx: int, device: torch.device) -> int:
+    """Get deterministic action from PPO actor."""
+    model.eval() # Ensure eval mode
+    with torch.no_grad():
+        state_tensor = torch.FloatTensor(state_norm).unsqueeze(0).to(device)
+        # Get action probabilities from the actor part
+        action_probs = model.get_action_probs(state_tensor) # [1, action_dim]
+
+        # Action Masking
+        probs_masked = action_probs.clone()
+        if current_lane_idx == 0:
+            probs_masked[0, 1] = -float('inf') # Effectively mask by setting prob to ~0
+        if current_lane_idx >= EvalConfig.NUM_LANES - 1:
+            probs_masked[0, 2] = -float('inf')
+
+        # Choose action with highest probability after masking
+        action = probs_masked.argmax().item()
+    return action
+
+
+#####################################
+# Evaluation Episode Runner         #
+#####################################
+
+EpisodeResult = namedtuple('EpisodeResult', [
+    'steps', 'collided', 'avg_speed', 'total_dist',
+    'forced_attempts', 'forced_agreed', 'forced_executed_safe', 'forced_executed_collision',
+    'model_lane_changes'
+])
+
+def evaluate_episode(
+    model: nn.Module,
+    model_type: str, # 'dqn' or 'ppo'
+    env: EvaluationEnv,
+    config: Any, # DQN_Config or PPO_Config
+    obs_normalizer: Optional[RunningMeanStd], # Initial normalizer state
+    device: torch.device,
+    eval_config: EvalConfig
+) -> Tuple[EpisodeResult, Optional[RunningMeanStd]]:
+    """Runs a single evaluation episode for a given model."""
+
+    state_raw = env.reset()
+    # Crucial: Create a deep copy of the normalizer for this episode run
+    current_obs_normalizer = copy.deepcopy(obs_normalizer)
+
+    done = False
+    step_count = 0
+    speeds = []
+    model_lane_changes = 0 # Count changes initiated by model action != 0
+
+    # Forced change tracking
+    forced_attempts = 0
+    forced_agreed = 0           # Model chose the desired action
+    forced_executed_safe = 0    # Model agreed, change completed, no collision
+    forced_executed_collision = 0 # Model agreed, change attempted, collision occurred
+    monitoring_change = False
+    monitor_steps_left = 0
+    monitor_target_action = -1
+    monitor_start_lane = -1
+    monitor_start_pos = None
+
+    while not done and step_count < eval_config.EVAL_MAX_STEPS:
+        # 1. Normalize state (updates and returns the episode-specific normalizer)
+        if model_type == 'dqn':
+             state_norm, current_obs_normalizer = normalize_state(state_raw, current_obs_normalizer, config.obs_norm_clip)
+        elif model_type == 'ppo':
+             state_norm, current_obs_normalizer = normalize_state(state_raw, current_obs_normalizer, config.obs_norm_clip)
+        else: # Should not happen
+             state_norm = state_raw
+             print("Warning: Unknown model type for normalization")
+
+
+        # 2. Get current lane and decide on forced change attempt
+        current_lane_idx = int(round(state_raw[1])) # Index 1 is lane index
+        current_lane_idx = np.clip(current_lane_idx, 0, eval_config.NUM_LANES - 1)
+        can_go_left = current_lane_idx > 0
+        can_go_right = current_lane_idx < (eval_config.NUM_LANES - 1)
+        target_action = -1 # -1 means no forced action
+
+        # Check if monitoring a previous attempt
+        if monitoring_change:
+            monitor_steps_left -= 1
+            current_pos = env.get_vehicle_info()['pos']
+            current_lane_after_step = env.get_vehicle_info()['lane']
+
+            # Check for successful physical change (significant lateral movement or lane index change)
+            lateral_dist = abs(current_pos[1] - monitor_start_pos[1])
+            lane_changed_physically = (current_lane_after_step != monitor_start_lane)
+
+            # Check completion criteria
+            if lane_changed_physically or lateral_dist > eval_config.FORCE_CHANGE_SUCCESS_DIST:
+                if env.collision_occurred: # Check if collision happened *during* monitoring
+                    forced_executed_collision += 1
+                    print(f"⚠️ Forced change ({monitor_target_action}) agreed but resulted in COLLISION.")
+                else:
+                    forced_executed_safe += 1
+                    print(f"✅ Forced change ({monitor_target_action}) executed successfully.")
+                monitoring_change = False # Stop monitoring this attempt
+            elif monitor_steps_left <= 0:
+                print(f"❌ Forced change ({monitor_target_action}) agreed but timed out (not executed).")
+                monitoring_change = False # Timed out
+            elif env.collision_occurred: # Collision happened before completion
+                 forced_executed_collision += 1
+                 print(f"⚠️ Forced change ({monitor_target_action}) agreed but resulted in COLLISION before completion.")
+                 monitoring_change = False
+
+        # Trigger a new forced attempt if not currently monitoring one
+        if not monitoring_change and step_count > 0 and step_count % eval_config.FORCE_CHANGE_INTERVAL_STEPS == 0:
+            if can_go_left and can_go_right:
+                target_action = random.choice([1, 2]) # Choose randomly if both possible
+            elif can_go_left:
+                target_action = 1 # Target left
+            elif can_go_right:
+                target_action = 2 # Target right
+
+            if target_action != -1:
+                forced_attempts += 1
+                print(f"\n--- Step {step_count}: Triggering Forced Lane Change Attempt (Target Action: {target_action}) ---")
+
+
+        # 3. Get Model Action
+        if model_type == 'dqn':
+            action = get_dqn_action(model, state_norm, current_lane_idx, config, device)
+        elif model_type == 'ppo':
+            action = get_ppo_action(model, state_norm, current_lane_idx, device)
+        else:
+            action = 0 # Fallback
+
+        # 4. Handle Forced Change Logic
+        if target_action != -1:
+            print(f"   - Model chose action: {action}")
+            if action == target_action:
+                forced_agreed += 1
+                print(f"   - Model AGREED with forced action {target_action}. Executing and monitoring...")
+                monitoring_change = True
+                monitor_steps_left = eval_config.FORCE_CHANGE_MONITOR_STEPS
+                monitor_target_action = target_action
+                monitor_start_lane = current_lane_idx
+                monitor_start_pos = env.get_vehicle_info()['pos']
+            else:
+                print(f"   - Model DISAGREED (chose {action}). Executing model's choice, not monitoring.")
+                # Continue with the model's chosen action, don't monitor
+
+        # Count model-initiated lane changes (only if not monitoring a successful forced one)
+        if action != 0 and not monitoring_change:
+             model_lane_changes += 1
+
+        # 5. Step Environment
+        next_state_raw, done = env.step(action)
+
+        # Update state and metrics
+        state_raw = next_state_raw
+        step_count += 1
+        vehicle_info = env.get_vehicle_info()
+        speeds.append(vehicle_info['speed'])
+
+        # If a collision occurs, stop monitoring any forced change immediately
+        if env.collision_occurred:
+            done = True # Ensure loop terminates
+            if monitoring_change:
+                 forced_executed_collision += 1 # Assume collision was related
+                 print(f"⚠️ Forced change ({monitor_target_action}) monitoring interrupted by COLLISION.")
+                 monitoring_change = False
+
+
+    # Episode End
+    avg_speed = np.mean(speeds) if speeds else 0.0
+    total_dist = env.get_vehicle_info()['dist']
+    collided = env.collision_occurred
+
+    # Handle case where monitoring was ongoing at episode end (timeout)
+    if monitoring_change:
+        print(f"❌ Forced change ({monitor_target_action}) monitoring ongoing at episode end (timeout).")
+
+    result = EpisodeResult(
+        steps=step_count,
+        collided=collided,
+        avg_speed=avg_speed,
+        total_dist=total_dist,
+        forced_attempts=forced_attempts,
+        forced_agreed=forced_agreed,
+        forced_executed_safe=forced_executed_safe,
+        forced_executed_collision=forced_executed_collision,
+        model_lane_changes=model_lane_changes
+    )
+
+    # Return result and the final state of the normalizer for this episode run
+    return result, current_obs_normalizer
+
+
+#####################################
+# Main Evaluation Script            #
+#####################################
+def main():
+    eval_config = EvalConfig()
+    dqn_train_config = DQN_Config()
+    ppo_train_config = PPO_Config()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # --- File Checks ---
+    if not os.path.exists(eval_config.DQN_MODEL_PATH):
+        print(f"ERROR: DQN Model path not found: {eval_config.DQN_MODEL_PATH}")
+        sys.exit(1)
+    if not os.path.exists(eval_config.PPO_MODEL_PATH):
+        print(f"ERROR: PPO Model path not found: {eval_config.PPO_MODEL_PATH}")
+        sys.exit(1)
+    if not os.path.exists(eval_config.EVAL_SUMO_CONFIG):
+        print(f"ERROR: Evaluation SUMO config not found: {eval_config.EVAL_SUMO_CONFIG}")
+        # Attempt to find referenced files
+        try:
+            with open(eval_config.EVAL_SUMO_CONFIG, 'r') as f:
+                content = f.read()
+                if 'new.net.xml' not in content: print("Warning: 'new.net.xml' not mentioned in sumocfg?")
+                if 'new.rou.xml' not in content: print("Warning: 'new.rou.xml' not mentioned in sumocfg?")
+            if not os.path.exists("new.net.xml"): print("Warning: new.net.xml not found.")
+            if not os.path.exists("new.rou.xml"): print("Warning: new.rou.xml not found.")
+        except Exception as e:
+            print(f"Could not read SUMO config: {e}")
+        sys.exit(1)
+
+
+    # --- Load Models ---
+    print("\n--- Loading Models ---")
+    dqn_model = load_model(eval_config.DQN_MODEL_PATH, 'dqn', dqn_train_config, device)
+    ppo_model = load_model(eval_config.PPO_MODEL_PATH, 'ppo', ppo_train_config, device)
+
+    # --- Initialize Normalizers ---
+    # Create initial normalizer instances based on training configs
+    # These will be copied and updated per-episode during evaluation runs
+    dqn_obs_normalizer_init = RunningMeanStd(shape=(dqn_train_config.state_dim,), alpha=dqn_train_config.norm_update_rate) if dqn_train_config.normalize_observations else None
+    ppo_obs_normalizer_init = RunningMeanStd(shape=(ppo_train_config.state_dim,), alpha=ppo_train_config.norm_update_rate) if ppo_train_config.normalize_observations else None
+    print("Initialized normalizers (will be updated per-episode during eval).")
+
+
+    # --- Initialize Environment ---
+    # Pass a base seed, it will be incremented per episode pair
+    base_seed = eval_config.EVAL_SEED
+    env = EvaluationEnv(eval_config, base_seed) # Seed will be updated inside loop
+
+    # --- Run Evaluation ---
+    print(f"\n--- Running Evaluation ({eval_config.EVAL_EPISODES} Episodes per Model) ---")
+    dqn_results_list: List[EpisodeResult] = []
+    ppo_results_list: List[EpisodeResult] = []
+
+    for i in tqdm(range(eval_config.EVAL_EPISODES), desc="Evaluating Episodes"):
+        episode_seed = base_seed + i
+        print(f"\n--- Episode {i+1}/{eval_config.EVAL_EPISODES} (Seed: {episode_seed}) ---")
+
+        # --- Evaluate DQN ---
+        print("Evaluating DQN...")
+        env.sumo_seed = episode_seed # Set seed for this episode
+        try:
+            dqn_result, _ = evaluate_episode(
+                dqn_model, 'dqn', env, dqn_train_config, dqn_obs_normalizer_init, device, eval_config
+            )
+            dqn_results_list.append(dqn_result)
+            print(f"DQN Ep {i+1} Result: Steps={dqn_result.steps}, Collided={dqn_result.collided}, AvgSpeed={dqn_result.avg_speed:.2f}")
+            print(f"  Forced Changes: Attempts={dqn_result.forced_attempts}, Agreed={dqn_result.forced_agreed}, ExecutedSafe={dqn_result.forced_executed_safe}, ExecutedCollision={dqn_result.forced_executed_collision}")
+        except (ConnectionError, RuntimeError, traci.exceptions.TraCIException, KeyboardInterrupt) as e:
+            print(f"Error during DQN evaluation episode {i+1}: {e}")
+            if isinstance(e, KeyboardInterrupt): break
+            env._close() # Ensure cleanup
+            time.sleep(1)
+        except Exception as e_other:
+            print(f"Unexpected Error during DQN evaluation episode {i+1}: {e_other}")
+            traceback.print_exc()
+            env._close(); time.sleep(1)
+
+
+        # --- Evaluate PPO ---
+        print("\nEvaluating PPO...")
+        env.sumo_seed = episode_seed # Use the SAME seed for PPO for fairness
+        try:
+            ppo_result, _ = evaluate_episode(
+                ppo_model, 'ppo', env, ppo_train_config, ppo_obs_normalizer_init, device, eval_config
+            )
+            ppo_results_list.append(ppo_result)
+            print(f"PPO Ep {i+1} Result: Steps={ppo_result.steps}, Collided={ppo_result.collided}, AvgSpeed={ppo_result.avg_speed:.2f}")
+            print(f"  Forced Changes: Attempts={ppo_result.forced_attempts}, Agreed={ppo_result.forced_agreed}, ExecutedSafe={ppo_result.forced_executed_safe}, ExecutedCollision={ppo_result.forced_executed_collision}")
+        except (ConnectionError, RuntimeError, traci.exceptions.TraCIException, KeyboardInterrupt) as e:
+            print(f"Error during PPO evaluation episode {i+1}: {e}")
+            if isinstance(e, KeyboardInterrupt): break
+            env._close() # Ensure cleanup
+            time.sleep(1)
+        except Exception as e_other:
+            print(f"Unexpected Error during PPO evaluation episode {i+1}: {e_other}")
+            traceback.print_exc()
+            env._close(); time.sleep(1)
+
+
+    # Close env after all episodes
+    env._close()
+    print("\n--- Evaluation Finished ---")
+
+    # --- Aggregate and Compare Results ---
+    if not dqn_results_list or not ppo_results_list:
+        print("No evaluation results collected. Exiting.")
+        return
+
+    results = {'dqn': {}, 'ppo': {}}
+    for model_key, results_list in [('dqn', dqn_results_list), ('ppo', ppo_results_list)]:
+        total_episodes = len(results_list)
+        results[model_key]['total_episodes'] = total_episodes
+
+        # Basic metrics
+        results[model_key]['avg_steps'] = np.mean([r.steps for r in results_list])
+        results[model_key]['std_steps'] = np.std([r.steps for r in results_list])
+        results[model_key]['collision_rate'] = np.mean([r.collided for r in results_list]) * 100
+        results[model_key]['avg_speed'] = np.mean([r.avg_speed for r in results_list])
+        results[model_key]['std_speed'] = np.std([r.avg_speed for r in results_list])
+        results[model_key]['avg_dist'] = np.mean([r.total_dist for r in results_list])
+        results[model_key]['avg_model_lc'] = np.mean([r.model_lane_changes for r in results_list]) # Avg model-initiated changes
+
+        # Forced change metrics
+        total_forced_attempts = sum(r.forced_attempts for r in results_list)
+        total_forced_agreed = sum(r.forced_agreed for r in results_list)
+        total_forced_executed_safe = sum(r.forced_executed_safe for r in results_list)
+        total_forced_executed_collision = sum(r.forced_executed_collision for r in results_list)
+
+        results[model_key]['total_forced_attempts'] = total_forced_attempts
+        # Agreement Rate: % of forced attempts where model chose the target action
+        results[model_key]['forced_agreement_rate'] = (total_forced_agreed / total_forced_attempts * 100) if total_forced_attempts > 0 else 0
+        # Execution Success Rate: % of *agreed* attempts that completed safely
+        results[model_key]['forced_execution_success_rate'] = (total_forced_executed_safe / total_forced_agreed * 100) if total_forced_agreed > 0 else 0
+        # Execution Collision Rate: % of *agreed* attempts that resulted in collision (during monitoring)
+        results[model_key]['forced_execution_collision_rate'] = (total_forced_executed_collision / total_forced_agreed * 100) if total_forced_agreed > 0 else 0
+
+    # --- Print Comparison ---
+    print("\n--- Results Comparison ---")
+    print(f"{'Metric':<32} | {'DQN':<20} | {'PPO':<20}")
+    print("-" * 78)
+    metrics_to_print = [
+        ('Avg. Steps', 'avg_steps', '.1f'),
+        ('Std Dev Steps', 'std_steps', '.1f'),
+        ('Avg. Speed (m/s)', 'avg_speed', '.2f'),
+        ('Std Dev Speed (m/s)', 'std_speed', '.2f'),
+        ('Avg. Distance (m)', 'avg_dist', '.1f'),
+        ('Collision Rate (%)', 'collision_rate', '.1f'),
+        ('Avg. Model Lane Changes', 'avg_model_lc', '.1f'),
+        ('Forced Attempts (Total)', 'total_forced_attempts', 'd'),
+        ('Forced Agreement Rate (%)', 'forced_agreement_rate', '.1f'),
+        ('Forced Execution Success Rate (%)', 'forced_execution_success_rate', '.1f'),
+        ('Forced Exec. Collision Rate (%)', 'forced_execution_collision_rate', '.1f'),
+    ]
+    for name, key, fmt in metrics_to_print:
+        dqn_val = results['dqn'].get(key, 'N/A')
+        ppo_val = results['ppo'].get(key, 'N/A')
+        dqn_str = format(dqn_val, fmt) if isinstance(dqn_val, (int, float)) else str(dqn_val)
+        ppo_str = format(ppo_val, fmt) if isinstance(ppo_val, (int, float)) else str(ppo_val)
+        print(f"{name:<32} | {dqn_str:<20} | {ppo_str:<20}")
+    print("-" * 78)
+
+
+    # --- Generate Plots ---
+    print("\n--- 生成图表 ---") # Changed
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    plot_filename = f"evaluation_comparison_{timestamp}.png"
+    fig, axes = plt.subplots(3, 2, figsize=(12, 15))
+    fig.suptitle('模型评估对比 (DQN vs PPO)', fontsize=16) # Changed
+    models = ['DQN', 'PPO'] # Keep algorithm names in English
+
+    # Plot 1: Forced Change Agreement Rate
+    rates = [results['dqn']['forced_agreement_rate'], results['ppo']['forced_agreement_rate']]
+    axes[0, 0].bar(models, rates, color=['skyblue', 'lightcoral'])
+    axes[0, 0].set_ylabel('比率 (%)') # Changed
+    axes[0, 0].set_title('强制换道: 模型同意率') # Changed
+    axes[0, 0].set_ylim(0, 105)
+    for i, v in enumerate(rates): axes[0, 0].text(i, v + 1, f"{v:.1f}%", ha='center')
+
+    # Plot 2: Forced Change Execution Success Rate (of agreed attempts)
+    rates = [results['dqn']['forced_execution_success_rate'], results['ppo']['forced_execution_success_rate']]
+    axes[0, 1].bar(models, rates, color=['skyblue', 'lightcoral'])
+    axes[0, 1].set_ylabel('比率 (%)') # Changed
+    axes[0, 1].set_title('强制换道: 执行成功率\n(同意换道的百分比)') # Changed
+    axes[0, 1].set_ylim(0, 105)
+    for i, v in enumerate(rates): axes[0, 1].text(i, v + 1, f"{v:.1f}%", ha='center')
+
+    # Plot 3: Overall Collision Rate
+    rates = [results['dqn']['collision_rate'], results['ppo']['collision_rate']]
+    axes[1, 0].bar(models, rates, color=['skyblue', 'lightcoral'])
+    axes[1, 0].set_ylabel('比率 (%)') # Changed
+    axes[1, 0].set_title('总碰撞率') # Changed
+    axes[1, 0].set_ylim(0, max(rates + [5])) # Adjust ylim dynamically
+    for i, v in enumerate(rates): axes[1, 0].text(i, v + 0.5, f"{v:.1f}%", ha='center')
+
+    # Plot 4: Average Speed
+    speeds_mean = [results['dqn']['avg_speed'], results['ppo']['avg_speed']]
+    speeds_std = [results['dqn']['std_speed'], results['ppo']['std_speed']]
+    axes[1, 1].bar(models, speeds_mean, yerr=speeds_std, capsize=5, color=['skyblue', 'lightcoral'])
+    axes[1, 1].set_ylabel('速度 (米/秒)') # Changed
+    axes[1, 1].set_title('平均速度') # Changed
+    for i, v in enumerate(speeds_mean): axes[1, 1].text(i, v + 0.5, f"{v:.2f}", ha='center')
+
+    # Plot 5: Average Steps per Episode
+    steps_mean = [results['dqn']['avg_steps'], results['ppo']['avg_steps']]
+    steps_std = [results['dqn']['std_steps'], results['ppo']['std_steps']]
+    axes[2, 0].bar(models, steps_mean, yerr=steps_std, capsize=5, color=['skyblue', 'lightcoral'])
+    axes[2, 0].set_ylabel('步数') # Changed
+    axes[2, 0].set_title('每回合平均步数') # Changed
+    for i, v in enumerate(steps_mean): axes[2, 0].text(i, v + 5, f"{v:.1f}", ha='center')
+
+    # Plot 6: Average Model-Initiated Lane Changes
+    lc_mean = [results['dqn']['avg_model_lc'], results['ppo']['avg_model_lc']]
+    axes[2, 1].bar(models, lc_mean, color=['skyblue', 'lightcoral'])
+    axes[2, 1].set_ylabel('次数') # Changed
+    axes[2, 1].set_title('模型发起的平均换道次数') # Changed
+    for i, v in enumerate(lc_mean): axes[2, 1].text(i, v + 0.2, f"{v:.1f}", ha='center')
+
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent title overlap
+    plt.savefig(plot_filename)
+    print(f"对比图表已保存至: {plot_filename}") # Changed
+    # plt.show() # Optionally show plot interactively
+
+
+    # --- Save Data ---
+    data_filename = f"evaluation_comparison_data_{timestamp}.json"
+    # Add raw episode data for potential deeper analysis
+    results['dqn']['raw_results'] = [r._asdict() for r in dqn_results_list]
+    results['ppo']['raw_results'] = [r._asdict() for r in ppo_results_list]
+    try:
+        with open(data_filename, 'w', encoding='utf-8') as f:
+            # Custom encoder for numpy types if any creep in (shouldn't with namedtuple)
+            class NpEncoder(json.JSONEncoder):
+                def default(self, obj):
+                    if isinstance(obj, np.integer): return int(obj)
+                    if isinstance(obj, np.floating): return float(obj)
+                    if isinstance(obj, np.ndarray): return obj.tolist()
+                    return super(NpEncoder, self).default(obj)
+            json.dump(results, f, indent=4, ensure_ascii=False, cls=NpEncoder)
+        print(f"Comparison data saved to: {data_filename}")
+    except Exception as e:
+        print(f"Error saving comparison data: {e}")
 
 if __name__ == "__main__":
     main()

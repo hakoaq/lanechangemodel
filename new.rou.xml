@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
+
+    <!-- 定义小轿车类型（可变道） -->
+     <vType id="car" vClass="passenger" accel="2.6" decel="4.5" sigma="0.5" length="5" maxSpeed="33.33" lcStrategic="0.0" lcSpeedGain="0.0" lcKeepRight="0.0" lcPushy="0.0" lcAssertive="0.0" lcCooperative="0.0"/>
+
+    
+    <!-- 定义基础路线 -->
+    <route id="route_E0" edges="E0"/>
+
+    <!-- 创建车流（不同类型车辆）- 流量降低一半 -->
+    <flow id="flow_car" type="car" route="route_E0" begin="0" end="3600" period="8" departLane="random" departSpeed="max"/>
+
+</routes>
