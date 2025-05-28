@@ -16,9 +16,9 @@
     <!-- 定义基础路线 -->
     <route id="route_E0" edges="E0"/>
 
-    <!-- 创建车流（不同类型车辆） -->
-    <flow id="flow_car" type="car" route="route_E0" begin="0" end="3600" period="4" departLane="random" departSpeed="max"/>
-    <flow id="flow_truck" type="truck" route="route_E0" begin="0" end="3600" period="6" departLane="random" departSpeed="max"/>
-    <flow id="flow_bus" type="bus" route="route_E0" begin="0" end="3600" period="10" departLane="random" departSpeed="max"/>
-    <flow id="flow_motorcycle" type="motorcycle" route="route_E0" begin="0" end="3600" period="8" departLane="2" departSpeed="max"/>
+    <!-- 创建车流（不同类型车辆），降低period以加大流量 -->
+    <flow id="flow_car" type="car" route="route_E0" begin="0" end="3600" period="2" departLane="random" departSpeed="max"/>
+    <flow id="flow_truck" type="truck" route="route_E0" begin="0" end="3600" period="3" departLane="random" departSpeed="max"/>
+    <flow id="flow_bus" type="bus" route="route_E0" begin="0" end="3600" period="5" departLane="random" departSpeed="max"/>
+    <flow id="flow_motorcycle" type="motorcycle" route="route_E0" begin="0" end="3600" period="4" departLane="2" departSpeed="max"/>
 </routes>

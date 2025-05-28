@@ -9,7 +9,7 @@
         <!-- 中间车道（小轿车、货车、公交车），最低速90 km/h，最高速100 km/h -->
         <lane id="E0_1" index="1" allow="passenger truck bus" speed="27.78" length="1000" shape="-28.77,53.44 85.47,53.61"/>
         <!-- 最右侧车道（货车、公交车、摩托车），最低速60 km/h，最高速80 km/h -->
-        <lane id="E0_2" index="2" allow="truck bus motorcycle" speed="22.22" length="1000" shape="-28.77,56.64 85.46,56.81"/>
+        <lane id="E0_2" index="2" allow="passenger truck bus motorcycle" speed="22.22" length="1000" shape="-28.77,56.64 85.46,56.81"/>
     </edge>
 
     <junction id="J0" type="dead_end" x="-28.77" y="58.24" incLanes="" intLanes="" shape="-28.77,58.24 -28.76,48.64"/>

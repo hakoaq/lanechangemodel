@@ -9,6 +9,6 @@
     <route id="route_E0" edges="E0"/>
 
     <!-- 创建车流（不同类型车辆）- 流量降低一半 -->
-    <flow id="flow_car" type="car" route="route_E0" begin="0" end="3600" period="8" departLane="random" departSpeed="max"/>
+    <flow id="flow_car" type="car" route="route_E0" begin="0" end="3600" period="2" departLane="random" departSpeed="max"/>
 
 </routes>
